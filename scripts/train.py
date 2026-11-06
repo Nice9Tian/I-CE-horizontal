@@ -41,12 +41,13 @@ def parse():
     ap.add_argument("--dropout", type=float, default=0.1)
     ap.add_argument("--c", type=float, default=2.0)
     ap.add_argument("--eps", type=float, default=0.05)
-    ap.add_argument("--sinkhorn-iters", type=int, default=10, help="outer rounds of the box-constrained solver (6 Newton steps per block)")
+    ap.add_argument("--sinkhorn-iters", type=int, default=10, help="outer rounds of the box-constrained solver (8 Newton steps per block)")
     ap.add_argument("--rho", type=float, default=0.0, help="0 = balanced columns")
     ap.add_argument("--self-attn", action="store_true", help="ablation: attention among latents")
     ap.add_argument("--ot", default="fermi", choices=["fermi", "exp"], help="membership solver: box-constrained (fermi) or plain entropic + clamp (exp)")
-    ap.add_argument("--anchor-mode", default="decode", choices=["decode", "mean", "meanmap", "hybrid"], help="free decode, soft group mean, learned linear map of the mean, or mean + decode")
-    ap.add_argument("--center", action="store_true", help="subtract the training pool's global mean vector from every input")
+    ap.add_argument("--anchor-mode", default="meanmap", choices=["decode", "mean", "meanmap", "hybrid"], help="free decode, soft group mean, learned linear map of the mean (default), or mean + decode")
+    ap.add_argument("--center", dest="center", action="store_true", default=True, help="subtract the training pool's global mean vector from every input (default)")
+    ap.add_argument("--no-center", dest="center", action="store_false")
     ap.add_argument("--pool-in-ram", action="store_true", help="read the pool into RAM instead of memory-mapping it")
     ap.add_argument("--weak-no-grad", action="store_true", help="ablation: encode the weak view without gradient (pure target + negatives)")
     # views
@@ -54,7 +55,7 @@ def parse():
     ap.add_argument("--ns-min", type=int, default=64)
     ap.add_argument("--ns-max", type=int, default=160)
     ap.add_argument("--p-doc", type=float, default=0.25)
-    ap.add_argument("--batch", type=int, default=32)
+    ap.add_argument("--batch", type=int, default=64)
     # loss
     ap.add_argument("--tau", type=float, default=0.07)
     ap.add_argument("--margin", type=float, default=0.15)
@@ -125,8 +126,8 @@ def main():
         model.set_center(mu); np.save(out / "center_mu.npy", mu)
         log({"event": "center", "mu_norm": float(np.linalg.norm(mu))})
     log({"event": "model", "params": model.n_params(), "anchor_mode": args.anchor_mode})
-    decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
-    no_decay = [p for n, p in model.named_parameters() if p.dim() < 2]          # LayerNorm, biases, g0 rows? (g0 is 2-D), gain, temperatures
+    decay = [p for n, p in model.named_parameters() if p.dim() >= 2 and "log_temp" not in n]
+    no_decay = [p for n, p in model.named_parameters() if p.dim() < 2 or "log_temp" in n]   # LayerNorm, biases, gain, temperatures
     opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd}, {"params": no_decay, "weight_decay": 0.0}],
                             lr=args.lr, betas=(0.9, 0.98))
 
@@ -169,7 +170,8 @@ def main():
         else:
             ow = model(xw, mw)
         os_ = model(xs, ms)
-        l_ice, st = ice_loss(xs, ms, os_["anchors"], os_["M"], ow["anchors"], ow["M"], xw, mw, tau=args.tau,
+        xs_c, xw_c = model.map_space(xs, ms), model.map_space(xw, mw)        # the elements in the anchors' space
+        l_ice, st = ice_loss(xs_c, ms, os_["anchors"], os_["M"], ow["anchors"], ow["M"], xw_c, mw, tau=args.tau,
                              margin=args.margin, alpha_in=args.alpha_in, alpha_x=args.alpha_x, sigma=args.sigma,
                              decay=not args.no_decay)
         l_inv = inv_loss(os_["anchors"], ow["anchors"])

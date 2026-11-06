@@ -47,6 +47,8 @@ def main():
     model, step, targs = load_model(Path(a.run), a.step, dev)
     F = Fixtures(Path(a.data_dir), load_wiki_docs=False, load_queries=False)
     X, L, rows, doclen = load_draw(a.cap, a.draw, Path(a.cache_dir))
+    prog = json.loads((Path(a.cache_dir) / f"draws_cap{a.cap}" / "progress.json").read_text())
+    assert prog.get("source") != "pool", "the pool-built selection pack has no full-pool row ids; point --cache-dir at the full-pool cache
     test, _ = F.fold_games(targs["fold"])
     if a.game_ids:
         gids = [int(x) for x in a.game_ids.split(",")]
@@ -65,7 +67,7 @@ def main():
             o = model(xb, torch.zeros(1, n, dtype=torch.bool, device=dev))
             A = o["anchors"][0].float().cpu().numpy()                     # (K, D)
             M = o["M"][0].float().cpu().numpy()                           # (n, K)
-            Z = l2(np.asarray(X[g, :n], dtype=np.float32))                # (n, D)
+            Z = l2(model.map_space(xb[0]).float().cpu().numpy())           # (n, D) sentences in the anchors' (centred) space
             sims = Z @ A.T                                                # (n, K)
             gram = A @ A.T
             entry = {"game": F.names[g], "gidx": int(g), "pack": n, "doclen": int(doclen[g]),

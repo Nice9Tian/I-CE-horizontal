@@ -32,7 +32,11 @@ def load_model(run: Path, step, dev):
     m = LatentArray(K=a["K"], d_model=a["d_model"], heads=a["heads"], rounds=a["rounds"], dropout=a["dropout"], c=a["c"],
                     eps=a["eps"], sinkhorn_iters=a["sinkhorn_iters"], rho=a["rho"], self_attn=a.get("self_attn", False), ot=a.get("ot", "fermi"),
                     anchor_mode=a.get("anchor_mode", "decode"), center=a.get("center", False)).to(dev)
-    m.load_state_dict(ck["model"]); m.eval()
+    sd = dict(ck["model"])
+    if "W.weight" in sd:                                                       # checkpoints from before W = I + dW
+        sd["dW.weight"] = sd.pop("W.weight") - torch.eye(sd["W.weight"].shape[0] if "W.weight" in sd else sd["dW.weight"].shape[0])
+    sd = {k: v for k, v in sd.items() if k in m.state_dict()}                 # drop layers this mode no longer has
+    m.load_state_dict(sd, strict=False); m.eval()
     return m, int(step), a
 
 

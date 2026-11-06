@@ -100,7 +100,7 @@ Nov 6, 2026 · @CHIRYUU YU · 修订 Nov 7, 2026（按本机数据与论文协�
 g_k ← 可学习初始化，k = 1…K
 重复 T = 3 轮：
   前 T−1 轮：多头交叉注意力（query = W_Q g_k，key/value = W_K z_i / W_V z_i），每个 latent 独立的 MLP 更新
-  第 T 轮：单头亲和度 S_ik = (W_Q g_k)·(W_K z_i)/√d，M = Sinkhorn(S)，
+  第 T 轮：单头余弦亲和度 S_ik = gain · cos(W_Q g_k, W_K z_i)，M = Sinkhorn(S)，
           用列归一化的 M 作为注意力权重聚合 W_V z_i，再过 MLP
 ```
 
@@ -116,11 +116,11 @@ g_k ← 可学习初始化，k = 1…K
 
 **锚点**
 
-`a_k = normalize( W · m̄_k )`，`m̄_k = Σ_i Ā_ik (z_i − μ)`，Ā 是按列归一化的成员矩阵 M，μ 是训练池句向量的全局均值（中心化，去掉 Qwen 嵌入的公共方向），W 是 1024 → 1024 的线性映射，单位阵初始化。锚点是成员句子的加权均值再经一个学到的线性度量，所以：
+`a_k = normalize( W · m̄_k )`，`m̄_k = Σ_i Ā_ik (z_i − μ)`，Ā 是按列归一化的成员矩阵 M，μ 是训练池句向量的全局均值（中心化，去掉 Qwen 嵌入的公共方向；μ 的范数 18.3，句向量范数 32），W = I + ΔW 是 1024 → 1024 的线性映射，ΔW 零初始化、权重衰减把它拉向单位阵。**损失、评估、人工抽查都在同一个空间里比**：元素、查询句子、tag 名字都只减 μ（不过 W），锚点侧才过 W。锚点是成员句子的加权均值再经一个学到的线性度量，所以：
 
 - 它钉在数据锥里，不会像自由解码那样飘到与所有句子都正交的方向（首跑的教训，见 §0）；
-- 可以直接检索最近的句子，看它代表什么话题（用 W 作用在句子上后比余弦，或直接看 m̄_k）；
-- 可以和 tag 名字的嵌入比余弦（读出三）：tag 向量同样减 μ、过 W，再比；
+- 可以直接检索最近的句子，看它代表什么话题（句子减 μ 后与锚点比余弦）；
+- 可以和 tag 名字的嵌入比余弦（读出三）：tag 向量同样减 μ，再比；
 - 跨游戏负例的衰减参照在同一空间里算（§4.1）。
 
 代码里保留了四种锚点定义作对照（`--anchor-mode`）：`decode` 自由解码（原稿）、`mean` 纯成员均值（不学 W，只学分组）、`meanmap` 上面的默认、`hybrid` 均值映射加自由解码的修正项。`--center` 控制中心化。
@@ -147,7 +147,7 @@ g_k ← 可学习初始化，k = 1…K
 \log\frac{e^{(s_{ik}-m)/\tau}}{e^{(s_{ik}-m)/\tau}+\sum_{j\in N_i} w_{kj}\,e^{s_{ij}/\tau}}
 ```
 
-衰减权重 w_kj 全部 stop-gradient，参照在冻结空间里算：
+衰减权重 w_kj 全部 stop-gradient，参照在冻结空间里算（开中心化时是减 μ 后的冻结空间，否则未中心化的句向量两两余弦都在 0.9 上下，参照分不出共享话题和不同话题）：
 
 ```latex
 \bar m_k = \mathrm{normalize}\Big(\textstyle\sum_i \mathrm{sg}(M_{ik})\, z_i\Big),\qquad
@@ -251,7 +251,7 @@ M = \arg\min_{0 \le Q \le 1}\ \langle Q, -S\rangle + \varepsilon \sum_{i,k}\big[
 | λ_inv | 1.0 | 0.3–3 | 锚点稳定性 vs 跨样本检索 |
 | σ（强视图噪声，单位球上） | 0.01 | 0.005–0.02 | 噪声范数 σ√1024 ≈ 0.32，余弦约 0.95；0.05 时余弦 0.53 |
 | d_model / 头 | 256 / 8 | — | — |
-| 优化器 | AdamW, lr 3e-4, wd 0.05（一维参数不衰减） | — | 1k 步 warmup + cosine |
+| 优化器 | AdamW, lr 3e-4, wd 0.05（一维参数和注意力温度不衰减） | — | 1k 步 warmup + cosine |
 
 **损失权重**：只有 λ_inv = 1.0。原五项分组约束及其 λ 全部取消，由 §4.2 的传输约束和 §4.3 的视图不变性替代。
 
@@ -307,7 +307,7 @@ F3 使用前先验证槽位一致性：对每个槽位 k，取 50 个游戏的 a
 问题：锚点是不是以语义形式代表内容。不训任何东西：锚点在 Qwen 空间，tag 名字也嵌进同一空间，直接比余弦。
 
 ```latex
-\mathrm{score}(n, t) = \max_{k} \cos\big(a_k^{(n)},\ e_t\big),\qquad e_t = \mathrm{rown}\big(\mathrm{Qwen}(\text{tag 名字})\big)
+\mathrm{score}(n, t) = \max_{k} \cos\big(a_k^{(n)},\ e_t - \mu\big),\qquad e_t = \mathrm{rown}\big(\mathrm{Qwen}(\text{tag 名字})\big)
 ```
 
 - 取 max 而不是 mean：一个 tag 通常只对应某一个方面，mean 会被无关锚点稀释。

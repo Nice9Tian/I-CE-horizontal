@@ -108,7 +108,7 @@ def fd_sinkhorn(S: torch.Tensor, mask: torch.Tensor, c: float, eps: float, iters
                 # unbalanced columns, KL penalty rho: the KKT condition is sum_i sigma(X + f + g_k) = t_k exp(-(eps/rho) g_k)
                 kappa = eps / rho
                 for _ in range(newton):
-                    p_ = torch.sigmoid(Xd + f + g); tgt = t_col * torch.exp(-kappa * g)
+                    p_ = torch.sigmoid(Xd + f + g); tgt = t_col * torch.exp((-kappa * g).clamp(-50.0, 50.0))
                     h = p_.sum(1, keepdim=True) - tgt
                     dh = (p_ * (1 - p_)).sum(1, keepdim=True) + kappa * tgt
                     g = g - (h / dh.clamp(min=1e-4)).clamp(-5.0, 5.0)
@@ -166,7 +166,7 @@ class SinkhornRound(nn.Module):
         self.gain = nn.Parameter(torch.tensor(1.0))        # S = gain * cos(q, k); the cap keeps S / eps solvable
         self.gain_max = 5.0
 
-    def forward(self, g, k, v, mask):
+    def forward(self, g, k, v, mask, update_latents: bool = True):
         q = F.normalize(self.q(self.ln_q(g)), dim=-1)                             # (B, K, d)
         S = torch.einsum("bkd,bnd->bnk", q, F.normalize(k, dim=-1)) * self.gain.clamp(0.2, self.gain_max)   # (B, N, K) in [-gain, gain]
         if self.ot == "fermi":
@@ -175,6 +175,8 @@ class SinkhornRound(nn.Module):
         else:                                                                     # legacy: plain entropic plan + clamp
             M = log_sinkhorn(S, mask, self.c, self.eps, self.iters, self.rho).clamp(max=1.0)
             self.last_errors = transport_errors(M, mask, self.c)                 # after the clamp: what the loss sees
+        if not update_latents:                                                    # mean / meanmap anchors need only M
+            return g, S, M
         A = M / M.sum(1, keepdim=True).clamp(min=1e-6)                            # column-normalised weights
         agg = torch.einsum("bnk,bnd->bkd", A.to(v.dtype), v)
         g = g + self.drop(self.o(agg))
@@ -199,8 +201,8 @@ class LatentArray(nn.Module):
         self.K, self.d_in, self.d_model, self.anchor_mode, self.center = K, d_in, d_model, anchor_mode, center
         self.register_buffer("mu", torch.zeros(d_in))
         if anchor_mode in ("meanmap", "hybrid"):
-            self.W = nn.Linear(d_in, d_in, bias=False)
-            nn.init.eye_(self.W.weight)
+            self.dW = nn.Linear(d_in, d_in, bias=False)                       # W = I + dW, dW zero-initialised
+            nn.init.zeros_(self.dW.weight)
         self.g0 = nn.Parameter(torch.randn(K, d_model) * 0.02)
         self.k = nn.Linear(d_in, d_model)
         self.v = nn.Linear(d_in, d_model)
@@ -210,8 +212,11 @@ class LatentArray(nn.Module):
         if self_attn:   # ablation: attention among the latents after every round
             self.sa = nn.ModuleList([nn.MultiheadAttention(d_model, heads, dropout=dropout, batch_first=True) for _ in range(rounds)])
             self.sa_ln = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(rounds)])
-        self.ln_a = nn.LayerNorm(d_model)
-        self.anchor = nn.Linear(d_model, d_in)
+        if anchor_mode in ("decode", "hybrid"):
+            self.ln_a = nn.LayerNorm(d_model)
+            self.anchor = nn.Linear(d_model, d_in)
+        else:                                                                     # the last round's latent update is unused
+            self.final.o = self.final.ln_m = self.final.mlp = None
 
     def _self(self, i, g):
         if self.sa is None:
@@ -222,22 +227,25 @@ class LatentArray(nn.Module):
     def set_center(self, mu):
         self.mu.copy_(torch.as_tensor(mu, dtype=self.mu.dtype, device=self.mu.device))
 
-    def map_space(self, z: torch.Tensor) -> torch.Tensor:
-        """the transform the anchors live in, for comparing raw Qwen vectors (tag names, sentences) with anchors"""
+    def W(self, z: torch.Tensor) -> torch.Tensor:
+        return z + self.dW(z)
+
+    def map_space(self, z: torch.Tensor, mask: torch.Tensor | None = None) -> torch.Tensor:
+        """raw Qwen vectors (sentences, tag names) brought into the space the loss compares anchors with:
+        centred when the model centres; W acts on the anchor side only, so it is NOT applied here"""
         z = z.float() - self.mu if self.center else z.float()
-        return self.W(z) if self.anchor_mode in ("meanmap", "hybrid") else z
+        return z.masked_fill(mask[..., None], 0.0) if mask is not None else z
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> dict:
         B = x.shape[0]
-        x = x.float()
-        if self.center:
-            x = (x - self.mu).masked_fill(mask[..., None], 0.0)
+        x = self.map_space(x, mask)                                           # centred (or raw) input space
         k, v = self.k(x), self.v(x)
         g = self.g0[None].expand(B, -1, -1)
         for i, r in enumerate(self.rounds):
             g = self._self(i, r(g, k, v, mask))
-        g, S, M = self.final(g, k, v, mask)
-        g = self._self(len(self.rounds), g)
+        g, S, M = self.final(g, k, v, mask, update_latents=self.anchor_mode in ("decode", "hybrid"))
+        if self.anchor_mode in ("decode", "hybrid"):
+            g = self._self(len(self.rounds), g)
         if self.anchor_mode == "decode":
             a = F.normalize(self.anchor(self.ln_a(g)), dim=-1)
         else:

@@ -53,7 +53,10 @@ def main():
             if model is None:
                 model = build(ck["args"], dev)
                 fold = ck["args"]["fold"]
-            model.load_state_dict(ck["model"]); model.eval()
+            sd = dict(ck["model"])
+            if "W.weight" in sd:
+                w = sd.pop("W.weight"); sd["dW.weight"] = w - torch.eye(w.shape[0])
+            model.load_state_dict({k: v for k, v in sd.items() if k in model.state_dict()}, strict=False); model.eval()
             t0 = time.time()
             G = encode_sets(model, X0, L0, dev); Q = encode_queries(model, F, dev)
             m = retrieval_metrics(Q, G, F, fold, device=dev)

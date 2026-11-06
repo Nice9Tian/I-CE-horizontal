@@ -32,8 +32,9 @@ def group_means(M: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
 
 def ice_loss(zs, mask_s, a_s, M_s, a_w, M_w, zw, mask_w, *, tau: float, margin: float, alpha_in: float,
              alpha_x: float, sigma: float, decay: bool = True):
-    """Returns (loss, stats).  zs/zw: standardised elements (B, N, D); masks True = padding;
-    a_s/a_w anchors (B, K, D) unit; M_s/M_w memberships (B, N, K)."""
+    """Returns (loss, stats).  zs/zw: elements (B, N, D) already brought into the anchors' space
+    (model.map_space: centred when the model centres); masks True = padding; a_s/a_w anchors (B, K, D) unit;
+    M_s/M_w memberships (B, N, K).  The decay references (group means) are computed in that same space."""
     B, Ns, D = zs.shape
     K = a_s.shape[1]
     dev = zs.device
