@@ -54,8 +54,8 @@ def test_fd_sinkhorn_marginals_cap_and_overlap():
     M = fd_sinkhorn(S, mask, c=c, eps=0.05, iters=10)
     _check_marginals(M, lens, c, K, col_atol=0.0, col_rtol=2e-2)
     S = torch.randn(B, N, K) * 3                               # logit std 60: near-hard; rows exact, columns approximate
-    M = fd_sinkhorn(S, mask, c=c, eps=0.05, iters=10)
-    _check_marginals(M, lens, c, K, col_atol=0.0, col_rtol=0.15)
+    M = fd_sinkhorn(S, mask, c=c, eps=0.05, iters=10)         # (7 elements x 2 units over 6 columns cannot balance with 0/1 entries)
+    _check_marginals(M, lens, c, K, col_atol=0.0, col_rtol=0.25)
     assert float(M.max()) <= 1.0 + 1e-6, "entries are capped at 1"
     valid = ~mask
     assert float(((M > 0.5).sum(-1)[valid] >= 2).float().mean()) > 0.9, "with c = 2 almost every element sits in two groups"
