@@ -48,7 +48,7 @@ def main():
     F = Fixtures(Path(a.data_dir), load_wiki_docs=False, load_queries=False)
     X, L, rows, doclen = load_draw(a.cap, a.draw, Path(a.cache_dir))
     prog = json.loads((Path(a.cache_dir) / f"draws_cap{a.cap}" / "progress.json").read_text())
-    assert prog.get("source") != "pool", "the pool-built selection pack has no full-pool row ids; point --cache-dir at the full-pool cache
+    assert prog.get("source") != "pool", "the pool-built selection pack has no full-pool row ids; point --cache-dir at the full-pool cache"
     test, _ = F.fold_games(targs["fold"])
     if a.game_ids:
         gids = [int(x) for x in a.game_ids.split(",")]

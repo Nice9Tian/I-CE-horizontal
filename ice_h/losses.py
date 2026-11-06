@@ -133,6 +133,8 @@ def monitors(M_w, mask_w, tw, M_s, mask_s, ds, a_s, a_w, ts=None) -> dict:
     gram = torch.einsum("bkd,bjd->bkj", a_w, a_w)
     off = gram[:, ~torch.eye(K, dtype=torch.bool, device=gram.device)]
     out["intra_cos"] = float(off.mean())
+    out["dup_pair_frac"] = float((off > 0.95).float().mean())                   # near-duplicate anchors inside a game
+    out["eff_anchors"] = float((1.0 / (gram > 0.95).float().sum(-1)).sum(-1).mean())   # distinct anchors per game (duplicates merged)
     out["stability"] = float((a_s * a_w).sum(-1).mean())
     flat = a_w.reshape(B * K, -1)
     sim = flat @ flat.T
