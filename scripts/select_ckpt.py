@@ -45,7 +45,7 @@ def main():
     F = Fixtures(Path(args.data_dir))
     X0, L0, _, _ = load_draw(args.cap, 0, Path(args.cache_dir)); X0 = np.ascontiguousarray(X0)
     sel_path = run / "selection.json"
-    selection = json.loads(sel_path.read_text()) if sel_path.exists() else {"best_step": None, "best_score": -1.0, "scores": {}}
+    selection = {"best_step": None, "best_score": -1.0, "scores": {}}           # recomputed from scratch for the checkpoints scored here
     model = None
     with open(run / "eval.jsonl", "a", encoding="utf-8") as ef:
         for p in ckpts:

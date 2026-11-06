@@ -95,7 +95,7 @@ def main():
         rows.append(r)
         Gf = frozen_mean(X, L)
         rf = {k.replace("slot_", ""): v for k, v in single_vector_metrics(Qf, Gf, F, a.fold).items()}
-        rf["tag_f1"] = tag_probe(F, a.fold, l2(Gf), {i: l2(Qf[i]) for i in range(len(Qf))})["micro_f1"]
+        rf["tag_f1"] = tag_probe(F, a.fold, Gf, {i: Qf[i] for i in range(len(Qf))})["micro_f1"]      # k10_eval: raw means
         if tag_emb is not None:
             rf["zs_map"] = zeroshot_single(Gf, tag_emb, F, a.fold)["macro_map"]
         rows_f.append(rf)

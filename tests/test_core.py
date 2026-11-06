@@ -81,6 +81,22 @@ def test_sinkhorn_is_differentiable():
     assert S.grad is not None and torch.isfinite(S.grad).all() and float(S.grad.abs().sum()) > 0
 
 
+def test_fd_sinkhorn_fractional_targets_and_tiny_views():
+    # fractional column targets (N c / K) and c = 1.5 converge; one-sentence views and N = 1 do not crash
+    S = torch.randn(2, 25, 6)                                                # logit std 20 at eps 0.05
+    mask = torch.zeros(2, 25, dtype=torch.bool)
+    M = fd_sinkhorn(S, mask, c=1.5, eps=0.05, iters=10)
+    assert torch.allclose(M.sum(-1), torch.full((2, 25), 1.5), atol=2e-3)
+    assert torch.allclose(M.sum(1), torch.full((2, 6), 25 * 1.5 / 6), rtol=0.1, atol=0)
+    S1 = torch.randn(1, 10, 6); m1 = torch.arange(10)[None, :] >= 1
+    M1 = fd_sinkhorn(S1, m1, 2.0, 0.05, 5)
+    assert torch.allclose(M1[0, 0].sum(), torch.tensor(2.0), atol=1e-3) and float(M1[0, 1:].abs().max()) == 0
+    M2 = fd_sinkhorn(torch.randn(1, 1, 6), torch.zeros(1, 1, dtype=torch.bool), 2.0, 0.05, 5)
+    assert torch.allclose(M2.sum(), torch.tensor(2.0), atol=1e-3)
+    Mu = fd_sinkhorn(S, mask, 2.0, 0.05, 10, rho=0.5)                       # unbalanced: rows exact, columns free
+    assert torch.allclose(Mu.sum(-1), torch.full((2, 25), 2.0), atol=2e-3)
+
+
 def test_model_forward_shapes_and_unit_anchors():
     m = LatentArray(K=5, d_in=32, d_model=16, heads=4, rounds=3, sinkhorn_iters=10)
     x = torch.randn(2, 12, 32)

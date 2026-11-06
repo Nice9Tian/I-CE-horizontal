@@ -90,7 +90,7 @@ def main():
             rf = single_vector_metrics(Qfroz, Gf, F, fold)
             rf = {k.replace("slot_", ""): v for k, v in rf.items()}
             if not args.no_tags:
-                rf["tag_f1_mean"] = tag_probe(F, fold, l2(Gf), {i: l2(Qfroz[i]) for i in range(len(Qfroz))})["micro_f1"]
+                rf["tag_f1_mean"] = tag_probe(F, fold, Gf, {i: Qfroz[i] for i in range(len(Qfroz))})["micro_f1"]   # k10_eval: raw means
                 if tag_emb is not None:
                     rf["zs_map"] = zeroshot_single(Gf, tag_emb, F, fold)["macro_map"]
             rows_froz.append(rf)

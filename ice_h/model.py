@@ -24,7 +24,7 @@ def log_sinkhorn(S: torch.Tensor, mask: torch.Tensor, c: float, eps: float, iter
     S     (B, N, K) affinities; the plan is argmin <Q, -S> + eps KL(Q || 1) under the marginals
     mask  (B, N) True = padding; padded rows carry no mass
     rho   None = balanced columns; finite = the column marginal is a KL penalty of weight rho
-          (unbalanced Sinkhorn: the column scaling is damped by rho / (rho + eps))
+          (unbalanced Sinkhorn: the column scaling is damped by rho / (rho + eps); exponential kernel only)
     Returns M (B, N, K), differentiable through the iterations.  Rows of real elements sum to c;
     columns sum to N_b c / K in the balanced case.
     """
@@ -64,14 +64,17 @@ def _shift_for_sum(X: torch.Tensor, target: torch.Tensor, dim: int, newton: int)
     """
     xs = X.sort(dim=dim, descending=True).values
     n = X.shape[dim]
-    t = target.floor().long().clamp(min=1, max=n - 1)                      # shape of target (broadcast of the slice index)
     shape = list(X.shape); shape[dim] = 1
-    t = t.expand(shape) if t.dim() == X.dim() else t.reshape(shape)
-    hi = xs.gather(dim, t - 1); lo = xs.gather(dim, t)
-    s = -(hi + lo) / 2
+    target = target.expand(shape) if target.dim() == X.dim() else target.reshape(shape)
+    t = target.floor().long().clamp(min=0, max=n - 1)                      # index of the (t+1)-th largest entry
+    delta = (target - t.float()).clamp(1e-4, 1 - 1e-4)                      # the fractional part of the target
+    x_t1 = xs.gather(dim, t)
+    s_frac = torch.logit(delta) - x_t1                                      # the (t+1)-th entry carries delta, larger ones ~1
+    s_mid = -(xs.gather(dim, (t - 1).clamp(min=0)) + x_t1) / 2              # integer target: midpoint between the t-th and (t+1)-th
+    s = torch.where((delta < 0.02) & (t >= 1), s_mid, s_frac)
     for _ in range(newton):
         p_ = torch.sigmoid(X + s)
-        h = p_.sum(dim, keepdim=True) - target.reshape(shape) if target.dim() != X.dim() else p_.sum(dim, keepdim=True) - target
+        h = p_.sum(dim, keepdim=True) - target
         dh = (p_ * (1 - p_)).sum(dim, keepdim=True).clamp(min=1e-4)
         s = s - (h / dh).clamp(-5.0, 5.0)
     return s
@@ -95,13 +98,20 @@ def fd_sinkhorn(S: torch.Tensor, mask: torch.Tensor, c: float, eps: float, iters
     n_b = valid.sum(1).clamp(min=1).float()
     t_col = (n_b * c / K)[:, None, None]                                      # (B, 1, 1)
     t_row = torch.full((B, N, 1), float(c), device=S.device)
-    damp = 1.0 if rho is None else rho / (rho + eps)
     with torch.no_grad():
         Xd = X.detach()
         f = torch.zeros(B, N, 1, device=S.device)
         g = torch.zeros(B, 1, K, device=S.device)
         for _ in range(iters):
-            g = damp * _shift_for_sum(Xd + f, t_col, dim=1, newton=newton)      # columns
+            g = _shift_for_sum(Xd + f, t_col, dim=1, newton=newton)             # columns (balanced)
+            if rho is not None:
+                # unbalanced columns, KL penalty rho: the KKT condition is sum_i sigma(X + f + g_k) = t_k exp(-(eps/rho) g_k)
+                kappa = eps / rho
+                for _ in range(newton):
+                    p_ = torch.sigmoid(Xd + f + g); tgt = t_col * torch.exp(-kappa * g)
+                    h = p_.sum(1, keepdim=True) - tgt
+                    dh = (p_ * (1 - p_)).sum(1, keepdim=True) + kappa * tgt
+                    g = g - (h / dh.clamp(min=1e-4)).clamp(-5.0, 5.0)
             f = _shift_for_sum(Xd + g, t_row, dim=2, newton=newton).masked_fill(mask[..., None], 0.0)   # rows, last
     M = torch.sigmoid(X + f + g)
     return M.masked_fill(mask[..., None], 0.0)
@@ -163,9 +173,8 @@ class SinkhornRound(nn.Module):
             M = fd_sinkhorn(S, mask, self.c, self.eps, self.iters, self.rho)
             self.last_errors = transport_errors(M, mask, self.c)
         else:                                                                     # legacy: plain entropic plan + clamp
-            M_raw = log_sinkhorn(S, mask, self.c, self.eps, self.iters, self.rho)
-            self.last_errors = transport_errors(M_raw, mask, self.c)
-            M = M_raw.clamp(max=1.0)
+            M = log_sinkhorn(S, mask, self.c, self.eps, self.iters, self.rho).clamp(max=1.0)
+            self.last_errors = transport_errors(M, mask, self.c)                 # after the clamp: what the loss sees
         A = M / M.sum(1, keepdim=True).clamp(min=1e-6)                            # column-normalised weights
         agg = torch.einsum("bnk,bnd->bkd", A.to(v.dtype), v)
         g = g + self.drop(self.o(agg))

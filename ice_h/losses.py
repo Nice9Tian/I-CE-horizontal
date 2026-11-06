@@ -104,20 +104,26 @@ def monitors(M_w, mask_w, tw, M_s, mask_s, ds, a_s, a_w, ts=None) -> dict:
     out["usage_min"] = float(share.mean(0).min())
     out["usage"] = [round(float(x), 4) for x in share.mean(0)]
     hw, hs = M_w > 0.5, M_s > 0.5
+    hard_share = (hw & valid_w[..., None]).float().sum(1) / valid_w.float().sum(1, keepdim=True).clamp(min=1)   # (B, K) hard members per group
+    out["hard_usage"] = [round(float(x), 4) for x in hard_share.mean(0)]
+    out["hard_usage_min"] = float(hard_share.mean(0).min())
     out["groups_per_elem_w"] = float(hw.sum(-1)[valid_w].float().mean())
     out["groups_per_elem_s"] = float(hs.sum(-1)[valid_s].float().mean()) if valid_s.any() else 0.0
     # distinct source documents per strong-view group
     hs_np, ds_np = hs.cpu().numpy(), np.asarray(ds)
     review_view = np.ones(B, bool) if ts is None else (np.asarray(ts)[:, 0] == 0)   # document views have one source by construction
-    docs = []
+    docs, empty = [], 0
     for b in np.flatnonzero(review_view):
         for k in range(K):
             sel = hs_np[b, :, k]
             if sel.any():
                 docs.append(len(np.unique(ds_np[b][sel])))
+            else:
+                empty += 1
     docs = np.asarray(docs) if docs else np.zeros(1)
     out["docs_per_group_s"] = float(docs.mean())
     out["groups_single_doc_frac"] = float((docs <= 1).mean())
+    out["groups_empty_frac"] = float(empty / max(1, len(docs) + empty))
     out["review_strong_frac"] = float(review_view.mean())
     # share of weak groups containing a description sentence
     tw_t = torch.as_tensor(np.asarray(tw), device=M_w.device) == 1                 # (B, Nw)

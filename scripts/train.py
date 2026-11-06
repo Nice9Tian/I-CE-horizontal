@@ -48,6 +48,7 @@ def parse():
     ap.add_argument("--anchor-mode", default="decode", choices=["decode", "mean", "meanmap", "hybrid"], help="free decode, soft group mean, learned linear map of the mean, or mean + decode")
     ap.add_argument("--center", action="store_true", help="subtract the training pool's global mean vector from every input")
     ap.add_argument("--pool-in-ram", action="store_true", help="read the pool into RAM instead of memory-mapping it")
+    ap.add_argument("--weak-no-grad", action="store_true", help="ablation: encode the weak view without gradient (pure target + negatives)")
     # views
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--ns-min", type=int, default=64)
@@ -124,7 +125,10 @@ def main():
         model.set_center(mu); np.save(out / "center_mu.npy", mu)
         log({"event": "center", "mu_norm": float(np.linalg.norm(mu))})
     log({"event": "model", "params": model.n_params(), "anchor_mode": args.anchor_mode})
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.98))
+    decay = [p for n, p in model.named_parameters() if p.dim() >= 2]
+    no_decay = [p for n, p in model.named_parameters() if p.dim() < 2]          # LayerNorm, biases, g0 rows? (g0 is 2-D), gain, temperatures
+    opt = torch.optim.AdamW([{"params": decay, "weight_decay": args.wd}, {"params": no_decay, "weight_decay": 0.0}],
+                            lr=args.lr, betas=(0.9, 0.98))
 
     # evaluation assets: draw 0 at the training budget, loaded once into RAM
     X0 = L0 = None
@@ -159,7 +163,11 @@ def main():
             gp["lr"] = lr_at(step - 1, args)
         batch = pref.next()
         xw, mw, xs, ms = to_dev(batch, dev)
-        ow = model(xw, mw)
+        if args.weak_no_grad:
+            with torch.no_grad():
+                ow = model(xw, mw)
+        else:
+            ow = model(xw, mw)
         os_ = model(xs, ms)
         l_ice, st = ice_loss(xs, ms, os_["anchors"], os_["M"], ow["anchors"], ow["M"], xw, mw, tau=args.tau,
                              margin=args.margin, alpha_in=args.alpha_in, alpha_x=args.alpha_x, sigma=args.sigma,
@@ -181,9 +189,10 @@ def main():
             mon.update(ot_row_err_w=ow["ot_row_err"], ot_col_err_w=ow["ot_col_err"], ot_row_err_s=os_["ot_row_err"], ot_col_err_s=os_["ot_col_err"],
                        s_std=float(os_["S"][~ms].std()))
             log({"step": step, "monitor": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in mon.items()}})
-        if step % args.save_every == 0 or step == args.steps:
+        do_eval = not args.no_eval and (step % args.eval_every == 0 or step == args.steps)
+        if step % args.save_every == 0 or step == args.steps or do_eval:        # every evaluated step has its checkpoint
             save_ckpt(step)
-        if not args.no_eval and (step % args.eval_every == 0 or step == args.steps):
+        if do_eval:
             evaluate(step)
     pref.close()
     log({"event": "done", "steps": args.steps, "hours": round((time.time() - t0) / 3600, 2), "selection": selection})

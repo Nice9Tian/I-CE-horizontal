@@ -199,7 +199,7 @@ def zeroshot_tags(anchors: np.ndarray, tag_emb: np.ndarray, F_: Fixtures, fold: 
     order = np.argsort(freq)
     bands = {"low": order[: len(order) // 3], "mid": order[len(order) // 3: 2 * len(order) // 3], "high": order[2 * len(order) // 3:]}
     out = {"macro_map": float(np.nanmean(aps)), "ap": {F_.tag_names[t]: (None if np.isnan(aps[t]) else float(aps[t])) for t in range(len(aps))},
-           "slot_hist": {F_.tag_names[t]: np.bincount(arg[:, t], minlength=anchors.shape[1]).tolist() for t in range(len(aps))}}
+           "slot_hist": {F_.tag_names[t]: np.bincount(arg[y[:, t] > 0, t], minlength=anchors.shape[1]).tolist() for t in range(len(aps))}}
     for name, ids in bands.items():
         out[f"map_{name}"] = float(np.nanmean(aps[ids]))
     return out

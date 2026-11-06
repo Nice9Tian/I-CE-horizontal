@@ -45,10 +45,10 @@ TYPE_REVIEW, TYPE_DESC, TYPE_WIKI = 0, 1, 2   # review sentence, store-page sent
 
 
 def rown(x, eps=1e-6):
-    """row standardisation, numpy version (float32 out)"""
+    """row standardisation, numpy version (float32 out); ddof = 1 like torch.std in the paper's scripts"""
     x = np.asarray(x, dtype=np.float32)
     m = x.mean(-1, keepdims=True)
-    s = x.std(-1, keepdims=True)
+    s = x.std(-1, keepdims=True, ddof=1)
     return (x - m) / (s + eps)
 
 
@@ -216,11 +216,12 @@ class PoolSampler:
             tw = np.concatenate([np.ones(len(sp), np.int8), tw])
         # strong view
         if strong_doc is not None:
+            strong_doc = strong_doc[: self.ns_max]                              # long articles: the first ns_max sentences
             xs, ds = strong_doc, np.full(len(strong_doc), strong_doc_id, np.int64)
             ts = np.full(len(strong_doc), TYPE_WIKI if strong_doc_id == DOC_ID_WIKI else TYPE_DESC, np.int8)
         else:
             rest = [j for j in order if not taken[j]]
-            fit = [j for j in rest if lens[j] <= self.ns_max] or sorted(rest, key=lambda j: lens[j])[:1]
+            fit = [j for j in rest if lens[j] <= self.ns_max]
             tot, s_segs = 0, []
             for j in fit:
                 L = int(lens[j])
@@ -229,6 +230,11 @@ class PoolSampler:
                 s_segs.append(j); tot += L
                 if tot >= self.ns_min:
                     break
+            if not s_segs and rest:                                             # only over-long reviews remain: the shortest, cut to ns_max
+                j = min(rest, key=lambda j: lens[j])
+                s_rows = np.arange(starts[j], starts[j] + min(int(lens[j]), self.ns_max)); s_segs = [j]
+                xs = self.POOL[g][s_rows]; ds = np.full(len(s_rows), rids[j], np.int64); ts = np.zeros(len(s_rows), np.int8)
+                return xw, w_doc.astype(np.int64), tw, xs, ds, ts
             s_rows = np.concatenate([np.arange(starts[j], starts[j] + lens[j]) for j in s_segs]) if s_segs else np.zeros(0, np.int64)
             xs = self.POOL[g][s_rows]
             ds = np.concatenate([np.repeat(rids[j], lens[j]) for j in s_segs]) if s_segs else np.zeros(0, np.int64)
@@ -358,6 +364,9 @@ def build_draw_cache(cap: int = 512, K: int = 10, out_dir: Path | None = None, d
     P = FullPool(data_dir)
     NG = F.NG if games is None else int(games)
     prog = out / "progress.json"
+    if prog.exists():
+        old = json.loads(prog.read_text())
+        assert (old["NG"], old["cap"], old["K"]) == (NG, cap, K), f"existing cache at {out} was built with {old}; use another directory"
     mode = "r+" if prog.exists() else "w+"
     arrs = [np.lib.format.open_memmap(out / f"draw{k}.npy", mode=mode, dtype=np.float16, shape=(NG, cap, 1024)) for k in range(K)]
     lens = [np.lib.format.open_memmap(out / f"len{k}.npy", mode=mode, dtype=np.int64, shape=(NG,)) for k in range(K)]
