@@ -159,12 +159,15 @@ class PoolSampler:
     """
 
     def __init__(self, F: Fixtures, train_games: np.ndarray, cap: int = 512, ns_min: int = 64, ns_max: int = 160,
-                 p_doc: float = 0.25, seed: int = 0, data_dir: Path = DATA_DIR, pool=None, rid=None, plen=None):
+                 p_doc: float = 0.25, seed: int = 0, data_dir: Path = DATA_DIR, pool=None, rid=None, plen=None,
+                 mmap: bool = True):
         self.F, self.cap, self.ns_min, self.ns_max, self.p_doc = F, cap, ns_min, ns_max, p_doc
         self.train_games = np.asarray(train_games, dtype=np.int64)
         self.rng = np.random.default_rng(seed)
         d = Path(data_dir)
-        self.POOL = pool if pool is not None else np.load(d / "wscan_pool_rev.npy")            # (NG, 2048, 1024) fp16, in RAM
+        # memory-mapped by default: on an NVMe mirror the OS page cache serves the rows and several
+        # processes share one copy; mmap=False reads the 8.5 GB into this process
+        self.POOL = pool if pool is not None else np.load(d / "wscan_pool_rev.npy", mmap_mode="r" if mmap else None)
         RID = rid if rid is not None else np.load(d / "wscan_pool_rev_rid.npy")
         PL = plen if plen is not None else np.load(d / "wscan_pool_rev_len.npy")
         assert self.POOL.shape[0] == F.NG
@@ -252,6 +255,17 @@ class PoolSampler:
             out["xw"][b, :n] = xw; out["lw"][b] = n; out["dw"][b, :n] = dw; out["tw"][b, :n] = tw
             out["xs"][b, :m] = xs; out["ls"][b] = m; out["ds"][b, :m] = ds; out["ts"][b, :m] = ts
         return out
+
+
+def pool_global_mean(POOL, plen, games, max_games: int = 400, seed: int = 0) -> np.ndarray:
+    """mean standardised sentence vector over (a sample of) the training games' pool rows: the centring vector"""
+    rng = np.random.default_rng(seed)
+    sel = rng.choice(np.asarray(games), min(max_games, len(games)), replace=False)
+    acc = np.zeros(POOL.shape[2], np.float64); n = 0
+    for g in sel:
+        x = np.asarray(POOL[int(g), : int(plen[int(g)])], dtype=np.float32)
+        acc += x.sum(0); n += x.shape[0]
+    return (acc / max(n, 1)).astype(np.float32)
 
 
 class Prefetcher:

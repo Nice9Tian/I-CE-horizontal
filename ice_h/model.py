@@ -178,10 +178,20 @@ class LatentArray(nn.Module):
 
     def __init__(self, K: int = 6, d_in: int = 1024, d_model: int = 256, heads: int = 8, rounds: int = 3,
                  dropout: float = 0.1, c: float = 2.0, eps: float = 0.05, sinkhorn_iters: int = 10,
-                 rho: float = 0.0, self_attn: bool = False, ot: str = "fermi"):
+                 rho: float = 0.0, self_attn: bool = False, ot: str = "fermi", anchor_mode: str = "decode",
+                 center: bool = False):
+        """anchor_mode: 'decode'  a_k = normalize(W_a LN(g_k))                       (free decode, can collapse)
+                        'mean'    a_k = normalize(sum_i A_ik z_i)                      (soft group mean, frozen space)
+                        'meanmap' a_k = normalize(W sum_i A_ik z_i), W = 1024x1024, identity init (learned metric on the mean)
+                        'hybrid'  a_k = normalize(W sum_i A_ik z_i + W_a LN(g_k))   (grounded in the data, plus a learned correction)
+           center: subtract a global mean vector (buffer ``mu``, set with set_center) from the inputs first"""
         super().__init__()
-        assert rounds >= 1
-        self.K, self.d_in, self.d_model = K, d_in, d_model
+        assert rounds >= 1 and anchor_mode in ("decode", "mean", "meanmap", "hybrid")
+        self.K, self.d_in, self.d_model, self.anchor_mode, self.center = K, d_in, d_model, anchor_mode, center
+        self.register_buffer("mu", torch.zeros(d_in))
+        if anchor_mode in ("meanmap", "hybrid"):
+            self.W = nn.Linear(d_in, d_in, bias=False)
+            nn.init.eye_(self.W.weight)
         self.g0 = nn.Parameter(torch.randn(K, d_model) * 0.02)
         self.k = nn.Linear(d_in, d_model)
         self.v = nn.Linear(d_in, d_model)
@@ -200,16 +210,37 @@ class LatentArray(nn.Module):
         h = self.sa_ln[i](g)
         return g + self.sa[i](h, h, h, need_weights=False)[0]
 
+    def set_center(self, mu):
+        self.mu.copy_(torch.as_tensor(mu, dtype=self.mu.dtype, device=self.mu.device))
+
+    def map_space(self, z: torch.Tensor) -> torch.Tensor:
+        """the transform the anchors live in, for comparing raw Qwen vectors (tag names, sentences) with anchors"""
+        z = z.float() - self.mu if self.center else z.float()
+        return self.W(z) if self.anchor_mode in ("meanmap", "hybrid") else z
+
     def forward(self, x: torch.Tensor, mask: torch.Tensor) -> dict:
         B = x.shape[0]
         x = x.float()
+        if self.center:
+            x = (x - self.mu).masked_fill(mask[..., None], 0.0)
         k, v = self.k(x), self.v(x)
         g = self.g0[None].expand(B, -1, -1)
         for i, r in enumerate(self.rounds):
             g = self._self(i, r(g, k, v, mask))
         g, S, M = self.final(g, k, v, mask)
         g = self._self(len(self.rounds), g)
-        a = F.normalize(self.anchor(self.ln_a(g)), dim=-1)
+        if self.anchor_mode == "decode":
+            a = F.normalize(self.anchor(self.ln_a(g)), dim=-1)
+        else:
+            A = M / M.sum(1, keepdim=True).clamp(min=1e-6)                       # (B, N, K) column-normalised membership
+            mbar = torch.einsum("bnk,bnd->bkd", A, x)                             # soft group means in the (centred) input space
+            if self.anchor_mode == "mean":
+                a = F.normalize(mbar, dim=-1)
+            elif self.anchor_mode == "meanmap":
+                a = F.normalize(self.W(mbar), dim=-1)
+            else:                                                                 # hybrid: the mean keeps the anchor in the data cone
+                base = self.W(mbar)
+                a = F.normalize(base + self.anchor(self.ln_a(g)) * base.norm(dim=-1, keepdim=True).detach() / math.sqrt(self.d_in), dim=-1)
         return {"anchors": a, "M": M, "S": S, "g": g, "ot_row_err": self.final.last_errors[0], "ot_col_err": self.final.last_errors[1]}
 
     def n_params(self) -> int:

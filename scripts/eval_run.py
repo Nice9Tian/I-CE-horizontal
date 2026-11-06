@@ -30,7 +30,8 @@ def load_model(run: Path, step, dev):
     ck = torch.load(run / f"ckpt_step{step}.pt", map_location="cpu", weights_only=False)
     a = ck["args"]
     m = LatentArray(K=a["K"], d_model=a["d_model"], heads=a["heads"], rounds=a["rounds"], dropout=a["dropout"], c=a["c"],
-                    eps=a["eps"], sinkhorn_iters=a["sinkhorn_iters"], rho=a["rho"], self_attn=a.get("self_attn", False), ot=a.get("ot", "fermi")).to(dev)
+                    eps=a["eps"], sinkhorn_iters=a["sinkhorn_iters"], rho=a["rho"], self_attn=a.get("self_attn", False), ot=a.get("ot", "fermi"),
+                    anchor_mode=a.get("anchor_mode", "decode"), center=a.get("center", False)).to(dev)
     m.load_state_dict(ck["model"]); m.eval()
     return m, int(step), a
 
@@ -62,6 +63,10 @@ def main():
     K = targs["K"]
     F = Fixtures(Path(args.data_dir))
     tag_emb = np.load(args.tag_emb, allow_pickle=True)[args.tag_key] if Path(args.tag_emb).exists() else None
+    tag_emb_model = None
+    if tag_emb is not None:
+        with torch.no_grad():
+            tag_emb_model = model.map_space(torch.as_tensor(tag_emb, device=dev)).cpu().numpy()   # the space the anchors live in
     t0 = time.time()
     Q = encode_queries(model, F, dev)                                             # (3256, K, D)
     Qmean, Qcat = features(Q, "mean"), features(Q, "concat")
@@ -76,7 +81,7 @@ def main():
             r["tag_f1_mean"] = tag_probe(F, fold, features(G, "mean"), {i: Qmean[i] for i in range(len(Qmean))})["micro_f1"]
             r["tag_f1_concat"] = tag_probe(F, fold, features(G, "concat"), {i: Qcat[i] for i in range(len(Qcat))})["micro_f1"]
             if tag_emb is not None:
-                z = zeroshot_tags(G, tag_emb, F, fold)
+                z = zeroshot_tags(G, tag_emb_model, F, fold)
                 r.update(zs_map=z["macro_map"], zs_map_low=z["map_low"], zs_map_mid=z["map_mid"], zs_map_high=z["map_high"])
                 r["_zs_detail"] = {"ap": z["ap"], "slot_hist": z["slot_hist"]}
         rows_model.append(r)

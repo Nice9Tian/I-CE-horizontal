@@ -19,7 +19,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, load_draw  # noqa: E402
+from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, load_draw, pool_global_mean  # noqa: E402
 from ice_h.evaluate import encode_queries, encode_sets, retrieval_metrics  # noqa: E402
 from ice_h.losses import ice_loss, inv_loss, monitors  # noqa: E402
 from ice_h.model import LatentArray  # noqa: E402
@@ -45,6 +45,9 @@ def parse():
     ap.add_argument("--rho", type=float, default=0.0, help="0 = balanced columns")
     ap.add_argument("--self-attn", action="store_true", help="ablation: attention among latents")
     ap.add_argument("--ot", default="fermi", choices=["fermi", "exp"], help="membership solver: box-constrained (fermi) or plain entropic + clamp (exp)")
+    ap.add_argument("--anchor-mode", default="decode", choices=["decode", "mean", "meanmap", "hybrid"], help="free decode, soft group mean, learned linear map of the mean, or mean + decode")
+    ap.add_argument("--center", action="store_true", help="subtract the training pool's global mean vector from every input")
+    ap.add_argument("--pool-in-ram", action="store_true", help="read the pool into RAM instead of memory-mapping it")
     # views
     ap.add_argument("--cap", type=int, default=512)
     ap.add_argument("--ns-min", type=int, default=64)
@@ -109,20 +112,24 @@ def main():
     idx = F.fold_indices(args.fold)
     log({"event": "fold", "fold": args.fold, "train": len(idx["train"]), "val": len(idx["val"]), "test": len(idx["test"])})
     sampler = PoolSampler(F, idx["train"], cap=args.cap, ns_min=args.ns_min, ns_max=args.ns_max, p_doc=args.p_doc,
-                          seed=args.seed, data_dir=Path(args.data_dir))
+                          seed=args.seed, data_dir=Path(args.data_dir), mmap=not args.pool_in_ram)
     log({"event": "pool_loaded", "sec": round(time.time() - t0, 1)})
     pref = Prefetcher(sampler, args.batch)
 
     model = LatentArray(K=args.K, d_model=args.d_model, heads=args.heads, rounds=args.rounds, dropout=args.dropout,
-                        c=args.c, eps=args.eps, sinkhorn_iters=args.sinkhorn_iters, rho=args.rho, self_attn=args.self_attn, ot=args.ot).to(dev)
-    log({"event": "model", "params": model.n_params()})
+                        c=args.c, eps=args.eps, sinkhorn_iters=args.sinkhorn_iters, rho=args.rho, self_attn=args.self_attn, ot=args.ot,
+                        anchor_mode=args.anchor_mode, center=args.center).to(dev)
+    if args.center:
+        mu = pool_global_mean(sampler.POOL, np.load(Path(args.data_dir) / "wscan_pool_rev_len.npy"), idx["train"])
+        model.set_center(mu); np.save(out / "center_mu.npy", mu)
+        log({"event": "center", "mu_norm": float(np.linalg.norm(mu))})
+    log({"event": "model", "params": model.n_params(), "anchor_mode": args.anchor_mode})
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd, betas=(0.9, 0.98))
 
     # evaluation assets: draw 0 at the training budget, loaded once into RAM
     X0 = L0 = None
     if not args.no_eval:
-        X0, L0, _, _ = load_draw(args.cap, 0, Path(args.cache_dir))
-        X0 = np.ascontiguousarray(X0)
+        X0, L0, _, _ = load_draw(args.cap, 0, Path(args.cache_dir))        # memory-mapped (NVMe page cache, shared across runs)
         log({"event": "draw0_loaded", "shape": list(X0.shape), "sec": round(time.time() - t0, 1)})
     selection = {"best_step": None, "best_score": -1.0, "scores": {}}
 

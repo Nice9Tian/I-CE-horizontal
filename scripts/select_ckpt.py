@@ -23,7 +23,8 @@ from ice_h.model import LatentArray  # noqa: E402
 def build(a, dev):
     return LatentArray(K=a["K"], d_model=a["d_model"], heads=a["heads"], rounds=a["rounds"], dropout=a["dropout"], c=a["c"],
                        eps=a["eps"], sinkhorn_iters=a["sinkhorn_iters"], rho=a["rho"], self_attn=a.get("self_attn", False),
-                       ot=a.get("ot", "fermi")).to(dev)
+                       ot=a.get("ot", "fermi"),
+                       anchor_mode=a.get("anchor_mode", "decode"), center=a.get("center", False)).to(dev)
 
 
 def main():
