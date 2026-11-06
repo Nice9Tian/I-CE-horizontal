@@ -1,2 +1,8 @@
 # 本机信息，不提交
 local.md
+
+# experiment outputs
+runs/
+*.pt
+__pycache__/
+.pytest_cache/
