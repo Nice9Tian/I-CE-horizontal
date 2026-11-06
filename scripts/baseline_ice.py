@@ -88,8 +88,7 @@ def main():
     rows, rows_f = [], []
     t0 = time.time()
     for d in range(a.draws):
-        X, L, _, _ = load_draw(a.cap, d, Path(a.cache_dir))
-        X = np.ascontiguousarray(X)
+        X, L, _, _ = load_draw(a.cap, d, Path(a.cache_dir))              # memory-mapped
         G = encode(tower, X, L, dev)
         r = {k.replace("slot_", ""): v for k, v in single_vector_metrics(Q, G, F, a.fold).items()}
         r["tag_f1"] = tag_probe(F, a.fold, G, {i: Q[i] for i in range(len(Q))})["micro_f1"]

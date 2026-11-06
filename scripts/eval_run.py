@@ -69,8 +69,7 @@ def main():
     Qfroz = frozen_mean(S, F.QL)                                                  # (3256, D)
     rows_model, rows_froz, rows_rand = [], [], []
     for d in range(args.draws):
-        X, L, _, _ = load_draw(args.cap, d, Path(args.cache_dir))
-        X = np.ascontiguousarray(X)
+        X, L, _, _ = load_draw(args.cap, d, Path(args.cache_dir))          # memory-mapped; batches are copied as needed
         G = encode_sets(model, X, L, dev)                                         # (NG, K, D)
         r = retrieval_metrics(Q, G, F, fold, device=dev)
         if not args.no_tags:

@@ -56,7 +56,7 @@ def encode_queries(model, F_: Fixtures, device, batch: int = 128) -> np.ndarray:
     return encode_sets(model, S, F_.QL, device, batch=batch)
 
 
-def frozen_mean(X, lens, batch: int = 256) -> np.ndarray:
+def frozen_mean(X, lens, batch: int = 32) -> np.ndarray:
     """the frozen-embedder baseline: mean of the standardised sentences (not unit-normalised)"""
     out = np.zeros((X.shape[0], X.shape[2]), np.float32)
     for i in range(0, X.shape[0], batch):
@@ -67,7 +67,7 @@ def frozen_mean(X, lens, batch: int = 256) -> np.ndarray:
     return out
 
 
-def random_group_anchors(X, lens, K: int, seed: int = 0, batch: int = 256) -> np.ndarray:
+def random_group_anchors(X, lens, K: int, seed: int = 0, batch: int = 64) -> np.ndarray:
     """baseline B3: each set's sentences randomly partitioned into K groups, group means as unit anchors"""
     rng = np.random.default_rng(seed)
     N, _, D = X.shape
