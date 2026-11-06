@@ -121,16 +121,19 @@ class CrossAttnRound(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(4 * d_model, d_model))
         self.drop = nn.Dropout(dropout)
         self.p = dropout
+        self.log_temp = nn.Parameter(torch.full((heads, 1, 1), math.log(10.0)))   # cosine attention temperature per head
 
     def forward(self, g, k, v, mask):
         B, K, d = g.shape
         N = k.shape[1]
         dh = d // self.h
-        q = self.q(self.ln_q(g)).view(B, K, self.h, dh).transpose(1, 2)        # (B, h, K, dh)
-        kk = k.view(B, N, self.h, dh).transpose(1, 2)
+        q = F.normalize(self.q(self.ln_q(g)).view(B, K, self.h, dh).transpose(1, 2), dim=-1)   # (B, h, K, dh)
+        kk = F.normalize(k.view(B, N, self.h, dh).transpose(1, 2), dim=-1)
         vv = v.view(B, N, self.h, dh).transpose(1, 2)
-        attend = (~mask)[:, None, None, :]                                       # True = may attend
-        a = F.scaled_dot_product_attention(q, kk, vv, attn_mask=attend, dropout_p=self.p if self.training else 0.0)
+        logits = torch.einsum("bhkd,bhnd->bhkn", q, kk) * self.log_temp.clamp(max=math.log(100.0)).exp()
+        logits = logits.masked_fill(mask[:, None, None, :], float("-inf"))
+        w = F.dropout(torch.softmax(logits, dim=-1), p=self.p, training=self.training)
+        a = torch.einsum("bhkn,bhnd->bhkd", w, vv)
         g = g + self.drop(self.o(a.transpose(1, 2).reshape(B, K, d)))
         g = g + self.drop(self.mlp(self.ln_m(g)))
         return g
@@ -150,11 +153,12 @@ class SinkhornRound(nn.Module):
         self.mlp = nn.Sequential(nn.Linear(d_model, 4 * d_model), nn.GELU(), nn.Dropout(dropout), nn.Linear(4 * d_model, d_model))
         self.drop = nn.Dropout(dropout)
         self.c, self.eps, self.iters, self.rho = c, eps, iters, rho
-        self.scale = 1.0 / math.sqrt(d_model)
+        self.gain = nn.Parameter(torch.tensor(1.0))        # S = gain * cos(q, k); the cap keeps S / eps solvable
+        self.gain_max = 5.0
 
     def forward(self, g, k, v, mask):
-        q = self.q(self.ln_q(g))                                                  # (B, K, d)
-        S = torch.einsum("bkd,bnd->bnk", q, k) * self.scale                       # (B, N, K) affinities
+        q = F.normalize(self.q(self.ln_q(g)), dim=-1)                             # (B, K, d)
+        S = torch.einsum("bkd,bnd->bnk", q, F.normalize(k, dim=-1)) * self.gain.clamp(0.2, self.gain_max)   # (B, N, K) in [-gain, gain]
         if self.ot == "fermi":
             M = fd_sinkhorn(S, mask, self.c, self.eps, self.iters, self.rho)
             self.last_errors = transport_errors(M, mask, self.c)
