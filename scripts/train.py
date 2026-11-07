@@ -80,6 +80,9 @@ def parse():
                     help="full: one FIXED 512-sentence pack per training game, all 1,694 games' topic anchors recomputed through the current W every step "
                          "(the original I-CE's gallery, plan 4.5); overrides --bank")
     ap.add_argument("--gallery-seed-offset", type=int, default=11, help="pack seeds default_rng(SPLIT_SEED + offset + g); 5 would reproduce the selection pack")
+    ap.add_argument("--overlap", default="auto", choices=["auto", "never", "always"],
+                    help="may the strong view reuse the pack's reviews? never (plan 2, the default below 2048), always, or auto: "
+                         "allowed when the pack can hold the whole pool (cap >= 2048), as the original I-CE's _g2048 runs did")
     ap.add_argument("--doc-source", default=None, choices=["both", "wiki"],
                     help="document strong views from the wiki article or the store page (both, the default without a bank) or from the wiki only "
                          "(default with --bank/--gallery: a store-page view would be the pack's own prefix)")
@@ -271,7 +274,10 @@ def main():
     sampler = PoolSampler(F, idx["train"], cap=args.cap, ns_min=args.ns_min, ns_max=args.ns_max, p_doc=args.p_doc,
                           seed=args.seed, data_dir=Path(args.data_dir), mmap=not args.pool_in_ram)
     sampler.allow_sp_doc = args.doc_source == "both"
+    overlap = args.overlap == "always" or (args.overlap == "auto" and args.cap >= 2048)
+    sampler.disjoint = not overlap
     plen = np.load(Path(args.data_dir) / "wscan_pool_rev_len.npy")
+    log({"event": "views", "doc_source": args.doc_source, "strong_may_overlap_pack": overlap})
     log({"event": "pool_loaded", "sec": round(time.time() - t0, 1)})
 
     # ---- model
@@ -313,7 +319,15 @@ def main():
         if args.gallery == "full":
             Xg, Lg, used = fixed_packs(F, sampler, idx["train"], cap=args.cap, seed_offset=args.gallery_seed_offset)
             gallery = {"X": Xg, "L": Lg}                                             # stays in host memory; chunks stream to the GPU when recomputed
-            sampler.exclude_rids = {int(g): set(u.tolist()) for g, u in zip(idx["train"], used)}   # strong views avoid the pack's reviews
+            if not overlap:                                                          # strong views avoid the pack's reviews where enough remain
+                excl = {}
+                for g, u in zip(idx["train"], used):
+                    starts, lens_g, rids_g = sampler.segs[int(g)]
+                    left = int(lens_g[~np.isin(rids_g, u)].sum())
+                    if left >= args.ns_min:
+                        excl[int(g)] = set(u.tolist())
+                sampler.exclude_rids = excl
+                log({"event": "gallery_exclusion", "games_excluding": len(excl), "games_total": len(used)})
             sampler.build_weak = False                                               # no re-sampled weak pack in gallery mode
             fill_bank_from_packs(bank, model, gallery["X"], gallery["L"], B=args.batch)
             log({"event": "gallery_built", "games": len(Lg), "mean_len": float(np.mean(Lg)), "full": int((Lg == args.cap).sum()),

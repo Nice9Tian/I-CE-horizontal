@@ -168,6 +168,7 @@ class PoolSampler:
         self.exclude_rids = None                 # game -> review ids the strong view must avoid (the fixed gallery pack's reviews)
         self.allow_sp_doc = True                 # store-page sentences as a document strong view (off in gallery/bank modes)
         self.build_weak = True                   # False: no weak pack (gallery mode uses the fixed packs)
+        self.disjoint = True                     # False: the strong view may reuse the pack's reviews (needed when the pack is the whole pool)
         d = Path(data_dir)
         # memory-mapped by default: on an NVMe mirror the OS page cache serves the rows and several
         # processes share one copy; mmap=False reads the 8.5 GB into this process
@@ -231,7 +232,7 @@ class PoolSampler:
             xs, ds = strong_doc, np.full(len(strong_doc), strong_doc_id, np.int64)
             ts = np.full(len(strong_doc), TYPE_WIKI if strong_doc_id == DOC_ID_WIKI else TYPE_DESC, np.int8)
         else:
-            rest = [j for j in order if not taken[j]]
+            rest = [j for j in order if (not taken[j]) or not self.disjoint]
             fit = [j for j in rest if lens[j] <= self.ns_max]
             tot, s_segs = 0, []
             for j in fit:
