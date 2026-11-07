@@ -140,3 +140,23 @@ def routed_bank_loss(zs, mask_s, M_s, rows, A, cov_A, batch_rows, *, tau: float,
         stats = {"pos_prob": float(prob_acc / wsum), "pos_cos": float(pos_cos_acc / wsum),
                  "n_pos_per_elem": float(P.sum(-1)[valid].float().mean()) if valid.any() else 0.0}
     return loss, stats
+
+
+@torch.no_grad()
+def fill_bank_from_packs(bank: AnchorBank, model, X, L, B: int = 64):
+    """the bank rows from FIXED packs (--gallery full): X fp16 (G, cap, D) on the bank's device (or numpy), L (G,).
+    Every row is replaced (first-visit semantics), so calling it again recomputes the gallery under the current
+    assignment (needed only when the prototypes or the gain learn)."""
+    dev = bank.S.device
+    G = X.shape[0]
+    bank.seen.zero_()
+    Lt = torch.as_tensor(L, device=dev)
+    for i in range(0, G, B):
+        xb = X[i:i + B]
+        xb = xb if torch.is_tensor(xb) else torch.from_numpy(xb)
+        n = int(Lt[i:i + B].max())
+        xb = xb[:, :n].to(dev)
+        mb = torch.arange(n, device=dev)[None, :] >= Lt[i:i + B][:, None]
+        xc = model.map_space(xb, mb)
+        M = model.membership(model.affinity(xc, mb), mb)
+        bank.update(torch.arange(i, min(i + B, G), device=dev), M, xc)

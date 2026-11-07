@@ -24,9 +24,9 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from ice_h.bank import AnchorBank, fill_bank, routed_bank_loss  # noqa: E402
+from ice_h.bank import AnchorBank, fill_bank, fill_bank_from_packs, routed_bank_loss  # noqa: E402
 from ice_h.codebook import TopicCodebook  # noqa: E402
-from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, load_draw, pool_global_mean, sample_pool_rows  # noqa: E402
+from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, fixed_packs, load_draw, pool_global_mean, sample_pool_rows  # noqa: E402
 from ice_h.evaluate import encode_queries, encode_sets, encode_topics, retrieval_metrics, topic_retrieval_metrics  # noqa: E402
 from ice_h.losses import ice_loss, inv_loss, monitors, routed_anchor_loss, routed_ice_loss, routed_inv_loss, topic_monitors  # noqa: E402
 from ice_h.model import LatentArray  # noqa: E402
@@ -75,7 +75,11 @@ def parse():
     ap.add_argument("--no-neg-cov", action="store_true", help="ablation: negatives not weighted by their coverage")
     ap.add_argument("--loss-level", default="sentence", choices=["sentence", "anchor", "both"],
                     help="routed I-CE on the strong view's sentences (plan 4.1), on its topic anchors (view level, the original I-CE's structure), or both")
-    ap.add_argument("--bank", default="none", choices=["none", "ema"], help="ema: EMA anchor bank of all training games as positives and negatives (plan 4.6)")
+    ap.add_argument("--bank", default="none", choices=["none", "ema"], help="ema: EMA anchor bank of all training games as positives and negatives (plan 4.5)")
+    ap.add_argument("--gallery", default="none", choices=["none", "full"],
+                    help="full: one FIXED 512-sentence pack per training game, all 1,694 games' topic anchors recomputed through the current W every step "
+                         "(the original I-CE's gallery, plan 4.5); overrides --bank")
+    ap.add_argument("--gallery-seed-offset", type=int, default=11, help="pack seeds default_rng(SPLIT_SEED + offset + g); 5 would reproduce the selection pack")
     ap.add_argument("--bank-beta", type=float, default=0.1, help="EMA rate of the bank rows per visit of the game (a game is visited every ~26 steps at B = 64)")
     ap.add_argument("--bank-refill", type=int, default=0, help="B-learn: recompute the whole bank from fresh packs every this many steps (0 = never; "
                                                                 "B-frozen needs none, the bank stores data-side quantities and the assignment is fixed)")
@@ -153,17 +157,22 @@ def step_A(model, batch, args, dev):
     return l_ice, l_inv, st, {"ow": ow, "os": os_, "mw": mw, "ms": ms, "xs": xs}
 
 
-def step_B_bank(model, bank, row_of_game, batch, args, dev):
-    """design B with the EMA anchor bank: the pack only updates the bank (no gradient); the strong view's elements
-    (and/or topic anchors) are contrasted against the bank anchors of all training games through the current W"""
+def step_B_bank(model, bank, row_of_game, batch, args, dev, gallery=None):
+    """design B against all training games' anchors.  --bank ema: the sampled pack updates its game's EMA row (no
+    gradient).  --gallery full: the bank holds the FIXED packs' topic sums; nothing is updated per step unless the
+    assignment learns (then the whole gallery is recomputed).  In both cases the strong view's elements (and/or topic
+    anchors) are contrasted against the bank anchors of all 1,694 training games through the current W."""
     xw, mw, xs, ms = to_dev(batch, dev)
     xw_c, xs_c = model.map_space(xw, mw), model.map_space(xs, ms)
     rows = row_of_game[torch.as_tensor(batch["gids"], device=dev)]
     with torch.no_grad():
         S_w = model.affinity(xw_c, mw)
         M_w = model.membership(S_w, mw)
-        ow = model.aggregate(xw_c, mw, M_w)
-        bank.update(rows, M_w, xw_c)
+        ow = model.aggregate(xw_c, mw, M_w)                                         # the sampled pack: monitors only in gallery mode
+        if gallery is None:
+            bank.update(rows, M_w, xw_c)
+        elif gallery["assignment_learns"]:
+            fill_bank_from_packs(bank, model, gallery["X"], gallery["L"], B=args.batch)
     S_s = model.affinity(xs_c, ms)
     M_s = model.membership(S_s, ms)
     os_ = model.aggregate(xs_c, ms, M_s)
@@ -263,14 +272,23 @@ def main():
         np.save(out / "protos_init.npy", model.protos.detach().cpu().numpy())
         log({"event": "codebook_init", **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in init.items()}, "sec": round(time.time() - t0, 1)})
     log({"event": "model", "design": args.design, "params": model.n_params(), "K": args.K})
-    bank = row_of_game = None
-    if args.design == "B" and args.bank == "ema":
+    bank = row_of_game = gallery = None
+    if args.design == "B" and (args.bank == "ema" or args.gallery == "full"):
         row_of_game = torch.full((F.NG,), -1, dtype=torch.long, device=dev)
         row_of_game[torch.as_tensor(idx["train"], device=dev)] = torch.arange(len(idx["train"]), device=dev)
         bank = AnchorBank(len(idx["train"]), args.K, 1024, beta=args.bank_beta, device=dev)
         tb = time.time()
-        fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch, log=log)
-        log({"event": "bank_filled", **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
+        if args.gallery == "full":
+            Xg, Lg = fixed_packs(F, sampler, idx["train"], cap=args.cap, seed_offset=args.gallery_seed_offset)
+            gallery = {"X": torch.from_numpy(Xg).to(dev), "L": Lg,
+                       "assignment_learns": args.learn_gain or args.freeze_protos != -1 or args.assign_map}
+            del Xg
+            fill_bank_from_packs(bank, model, gallery["X"], gallery["L"], B=args.batch)
+            log({"event": "gallery_built", "games": len(Lg), "mean_len": float(np.mean(Lg)), "full": int((Lg == args.cap).sum()),
+                 "assignment_learns": gallery["assignment_learns"], **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
+        else:
+            fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch, log=log)
+            log({"event": "bank_filled", **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
 
     # ---- optimiser
     if args.design == "A":
@@ -330,7 +348,7 @@ def main():
     if args.design == "A":
         step_fn = step_A
     elif bank is not None:
-        step_fn = lambda model, batch, args, dev: step_B_bank(model, bank, row_of_game, batch, args, dev)   # noqa: E731
+        step_fn = lambda model, batch, args, dev: step_B_bank(model, bank, row_of_game, batch, args, dev, gallery)   # noqa: E731
     else:
         step_fn = step_B
     for step in range(1, args.steps + 1):
@@ -341,7 +359,7 @@ def main():
             if gain_learns:
                 model.gain.requires_grad_(True)
             log({"event": "protos_unfrozen", "step": step, "gain_learns": gain_learns})
-        if bank is not None and args.bank_refill > 0 and step % args.bank_refill == 0:   # stale topic boundaries after the prototypes moved
+        if bank is not None and gallery is None and args.bank_refill > 0 and step % args.bank_refill == 0:   # stale topic boundaries after the prototypes moved
             tb = time.time()
             bank.seen.zero_()
             fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch)

@@ -425,3 +425,32 @@ def sample_pool_rows(POOL, plen, games, n_games: int = 400, per_game: int = 500,
         rows = np.sort(rng.choice(n, min(per_game, n), replace=False))
         out.append(np.asarray(POOL[int(g)][rows], dtype=np.float32))
     return np.concatenate(out)
+
+
+def fixed_packs(F: Fixtures, sampler: PoolSampler, games, cap: int = 512, seed_offset: int = 11):
+    """one FIXED 512-sentence pack per game from the review pool by the k10 pack rule (store-page prefix, then whole
+    reviews in a seeded random order while they fit): the training gallery of --gallery full.  Seeds
+    default_rng(SPLIT_SEED + seed_offset + g), so the packs differ from the pool-built selection pack (offset 5).
+    Returns X fp16 (G, cap, 1024), lens (G,)."""
+    games = np.asarray(games, dtype=np.int64)
+    X = np.zeros((len(games), cap, 1024), np.float16)
+    L = np.zeros(len(games), np.int64)
+    for j, g in enumerate(games):
+        starts, lens, _ = sampler.segs[int(g)]
+        rng = np.random.default_rng(SPLIT_SEED + seed_offset + int(g))
+        sp = F.doc(int(g))
+        row = 0 if sp is None else len(sp)
+        if sp is not None:
+            X[j, :row] = sp
+        rows = []
+        for i in rng.permutation(len(lens)):
+            n = int(lens[i])
+            if row + n <= cap:
+                rows.append(np.arange(starts[i], starts[i] + n)); row += n
+                if row == cap:
+                    break
+        if rows:
+            rr = np.concatenate(rows)
+            X[j, row - len(rr):row] = sampler.POOL[int(g)][rr]
+        L[j] = row
+    return X, L
