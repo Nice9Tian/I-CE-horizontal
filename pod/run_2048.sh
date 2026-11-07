@@ -11,7 +11,7 @@ R="$ROOT/results"; mkdir -p "$R"
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 TAG="--tag-emb $ROOT/cache/tag_emb.npz"
 log "B2 rescoring: paper 512 checkpoint on 512 draws (pipeline check against the local 0.921 / 0.653), docfix512 on 512 and 2048, the paper's _g2048 on 2048"
-python scripts/baseline_ice.py --ckpt "$ROOT/ckpts/ckpt_w9cv_wcle_i2ce_icetf_fold0_d512_fp_ep400.pt" --family pub512 --cap 512 --draws 10 --cache-dir "$ROOT/cache" --data-dir "$D" $TAG --out "$R/baseline_pub512_fold0_cap512.json"
+python scripts/baseline_ice.py --ckpt "$ROOT/ckpts/ckpt_w9cv_wcle_i2ce_icetf_fold0_fp_ep400.pt" --family pub512 --cap 512 --draws 10 --cache-dir "$ROOT/cache" --data-dir "$D" $TAG --out "$R/baseline_pub512_fold0_cap512.json"
 python scripts/baseline_ice.py --ckpt "$ROOT/ckpts/ckpt_w9cv_wcle_i2ce_icetf_fold0_d512_fp_ep1400.pt" --cap 512 --draws 10 --cache-dir "$ROOT/cache" --data-dir "$D" $TAG --out "$R/baseline_docfix512_fold0_cap512.json"
 python scripts/baseline_ice.py --ckpt "$ROOT/ckpts/ckpt_w9cv_wcle_i2ce_icetf_fold0_d512_fp_ep1400.pt" --cap 2048 --draws 10 --cache-dir "$ROOT/cache" --data-dir "$D" $TAG --out "$R/baseline_docfix512_fold0_cap2048.json"
 python scripts/baseline_ice.py --ckpt "$ROOT/ckpts/ckpt_w9cv_wcle_i2ce_icetf_fold0_g2048_fp_ep1750.pt" --cap 2048 --draws 10 --cache-dir "$ROOT/cache" --data-dir "$D" $TAG --out "$R/baseline_g2048_fold0_cap2048.json"
