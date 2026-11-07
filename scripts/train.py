@@ -76,7 +76,9 @@ def parse():
     ap.add_argument("--loss-level", default="sentence", choices=["sentence", "anchor", "both"],
                     help="routed I-CE on the strong view's sentences (plan 4.1), on its topic anchors (view level, the original I-CE's structure), or both")
     ap.add_argument("--bank", default="none", choices=["none", "ema"], help="ema: EMA anchor bank of all training games as positives and negatives (plan 4.6)")
-    ap.add_argument("--bank-beta", type=float, default=0.05, help="EMA rate of the bank rows (per visit of the game)")
+    ap.add_argument("--bank-beta", type=float, default=0.1, help="EMA rate of the bank rows per visit of the game (a game is visited every ~26 steps at B = 64)")
+    ap.add_argument("--bank-refill", type=int, default=0, help="B-learn: recompute the whole bank from fresh packs every this many steps (0 = never; "
+                                                                "B-frozen needs none, the bank stores data-side quantities and the assignment is fixed)")
     # design A
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--d-model", type=int, default=256)
@@ -339,6 +341,11 @@ def main():
             if gain_learns:
                 model.gain.requires_grad_(True)
             log({"event": "protos_unfrozen", "step": step, "gain_learns": gain_learns})
+        if bank is not None and args.bank_refill > 0 and step % args.bank_refill == 0:   # stale topic boundaries after the prototypes moved
+            tb = time.time()
+            bank.seen.zero_()
+            fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch)
+            log({"event": "bank_refilled", "step": step, "sec": round(time.time() - tb, 1)})
         batch = pref.next()
         l_ice, l_inv, st, aux = step_fn(model, batch, args, dev)
         loss = l_ice + args.lam_inv * l_inv
