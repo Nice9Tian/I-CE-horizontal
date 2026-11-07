@@ -4,6 +4,7 @@ solution, the all-excluded negative row, the gain projection, checkpoint round t
 import sys
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -95,6 +96,21 @@ def test_load_state_roundtrip_both_designs():
     sd_legacy["W.weight"] = torch.eye(1024) + 0.01 * torch.randn(1024, 1024)
     load_state(ma, sd_legacy, "A")
     assert torch.allclose(ma.dW.weight, sd_legacy["W.weight"] - torch.eye(1024), atol=1e-6)
+
+
+def test_kernel_ridge_matches_sklearn():
+    from sklearn.linear_model import Ridge
+    from sklearn.preprocessing import StandardScaler
+    from ice_h.evaluate import kernel_ridge_scores
+    rng = np.random.default_rng(0)
+    Xtr = rng.normal(size=(60, 300)) * rng.uniform(0.5, 3, size=300); ytr = (rng.random((60, 4)) < 0.4).astype(np.float32)
+    Xva = rng.normal(size=(15, 300)) * rng.uniform(0.5, 3, size=300)
+    sc = StandardScaler().fit(Xtr); Xtr_s, Xva_s = sc.transform(Xtr), sc.transform(Xva)
+    alphas = (0.1, 10.0, 1000.0)
+    ours = kernel_ridge_scores(Xtr_s, ytr, [Xva_s], alphas)
+    for a, (sva,) in zip(alphas, ours):
+        ref = Ridge(alpha=a).fit(Xtr_s, ytr).predict(Xva_s)
+        assert np.allclose(sva, ref, atol=1e-5), (a, np.abs(sva - ref).max())
 
 
 def test_topic_retrieval_keys_match_tmodes():

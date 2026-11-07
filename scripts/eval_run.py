@@ -20,8 +20,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, load_draw  # noqa: E402
-from ice_h.evaluate import (CONCAT_ALPHAS, MODES, TMODES, encode_queries, encode_sets, encode_topics, features, frozen_mean, l2,  # noqa: E402
-                            random_group_anchors, retrieval_metrics, single_vector_metrics, tag_probe, topic_features,
+from ice_h.evaluate import (MODES, TMODES, encode_queries, encode_sets, encode_topics, features, frozen_mean, l2,  # noqa: E402
+                            random_group_anchors, retrieval_metrics, single_vector_metrics, tag_probe, tag_probe_kernel, topic_features,
                             topic_retrieval_metrics, zeroshot_single, zeroshot_tags, zeroshot_topics)
 from ice_h.runs import load_model  # noqa: E402
 
@@ -83,8 +83,8 @@ def main():
             r = topic_retrieval_metrics(Q, G, F, fold, device=dev)
             if not args.no_tags:
                 for kind in kinds:
-                    r[f"tag_f1_{kind}"] = tag_probe(F, fold, topic_features(G, kind), {int(i): Qfeat[kind][j] for j, i in enumerate(test_rows)},
-                                                    alphas=CONCAT_ALPHAS if kind == "concat" else None)["micro_f1"]
+                    probe = tag_probe_kernel if kind == "concat" else tag_probe             # F3: dual solver, all alphas at once
+                    r[f"tag_f1_{kind}"] = probe(F, fold, topic_features(G, kind), {int(i): Qfeat[kind][j] for j, i in enumerate(test_rows)})["micro_f1"]
                 if tag_emb is not None:
                     z = zeroshot_topics(G, tag_emb_model, tag_hist, F, fold)
                     r.update(zs_map_routed=z["macro_map_routed"], zs_map_max=z["macro_map_max"], zs_map_low=z["map_low_routed"],

@@ -155,7 +155,55 @@ def _ridge_tools():
     return micro_prf, train_anchor_ridge
 
 
-CONCAT_ALPHAS = (0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0, 100000.0)
+CONCAT_ALPHAS = (0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0, 100000.0)
+
+
+def kernel_ridge_scores(Xtr: np.ndarray, ytr: np.ndarray, Xs: list, alphas) -> list:
+    """Ridge with intercept, solved in the dual for every alpha at once (one eigendecomposition of the n x n Gram
+    matrix): returns, per alpha, the list of score matrices for the X in Xs.  Identical to sklearn's Ridge
+    (fit_intercept=True) on standardised features when n_samples < n_features, hundreds of times faster at
+    d = 65,536 (the F3 probe)."""
+    Xtr = np.asarray(Xtr, np.float64)
+    ytr = np.asarray(ytr, np.float64)
+    xm = Xtr.mean(0)
+    Xc = Xtr - xm
+    ym = ytr.mean(0)
+    lam, U = np.linalg.eigh(Xc @ Xc.T)
+    Uy = U.T @ (ytr - ym)                                                           # (n, T)
+    Ks = [(np.asarray(X, np.float64) - xm) @ Xc.T for X in Xs]                      # (m, n)
+    out = []
+    for a in alphas:
+        dual = U @ (Uy / (lam + float(a))[:, None])                                 # (K + a I)^-1 (y - ybar)
+        out.append([Kx @ dual + ym for Kx in Ks])
+    return out
+
+
+def tag_probe_kernel(F_: Fixtures, fold: int, Gfeat: np.ndarray, Qfeat_by_row: dict, alphas=CONCAT_ALPHAS) -> dict:
+    """the paper's probe protocol (StandardScaler on the training games, alpha and threshold chosen on the validation
+    games' features, micro-F1 on the test games' neutral query features) with the dual solver above, for the
+    high-dimensional F3 feature"""
+    from sklearn.preprocessing import StandardScaler
+    micro_prf, _ = _ridge_tools()
+    import VICReg_review.text_variant_eval as tve
+    test, val = F_.fold_games(fold)
+    train_idx = np.array([F_.n2i[n] for n in F_.names if n not in test | val], dtype=np.int64)
+    val_idx = np.array(sorted(F_.n2i[n] for n in val), dtype=np.int64)
+    scaler = StandardScaler().fit(Gfeat[train_idx])
+    Xtr, Xva = scaler.transform(Gfeat[train_idx]), scaler.transform(Gfeat[val_idx])
+    ytr, yva = F_.y[train_idx].astype(np.float32), F_.y[val_idx]
+    ti = F_.query_rows(test, "neutral")
+    Xq = scaler.transform(np.stack([Qfeat_by_row[int(i)] for i in ti]).astype(np.float32))
+    lab = np.stack([F_.y[F_.n2i[F_.art[i]]] for i in ti])
+    best = None
+    for a, (sva, sq) in zip(alphas, kernel_ridge_scores(Xtr, ytr, [Xva, Xq], alphas)):
+        for th in tve.threshold_grid(sva, 33):
+            mv = micro_prf(yva, sva, float(th))
+            key = (mv["micro_f1"], mv["recall"], -float(a))
+            if best is None or key > best[0]:
+                best = (key, float(a), float(th), mv, sq)
+    m = micro_prf(lab, best[4], best[2])
+    return {"micro_f1": float(m["micro_f1"]), "precision": float(m["precision"]), "recall": float(m["recall"]),
+            "alpha": best[1], "threshold": best[2], "val_f1": float(best[3]["micro_f1"])}
 
 
 def tag_probe(F_: Fixtures, fold: int, Gfeat: np.ndarray, Qfeat_by_row: dict, alphas=None) -> dict:
