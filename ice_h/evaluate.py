@@ -208,3 +208,129 @@ def zeroshot_tags(anchors: np.ndarray, tag_emb: np.ndarray, F_: Fixtures, fold: 
 def zeroshot_single(vec: np.ndarray, tag_emb: np.ndarray, F_: Fixtures, fold: int) -> dict:
     """the frozen-mean baseline for the zero-shot reading: cos(mean, e_t)"""
     return zeroshot_tags(vec[:, None, :], tag_emb, F_, fold)
+
+
+# ============================================================================ design B: topic encodings, scores, features
+TMODES = ("routed", "routed_norm", "routed_raw", "mean", "hist")
+
+
+@torch.no_grad()
+def encode_topics(model, X, lens, device, batch: int = 64) -> dict:
+    """X fp16 (N, L, D) standardised (memmap OK), lens (N,) -> {anchors fp16 (N, K, D), hist (N, K), cov (N, K), mean (N, D)}"""
+    model.eval()
+    N = X.shape[0]
+    acc = {"anchors": [], "hist": [], "cov": [], "mean": []}
+    for i in range(0, N, batch):
+        L = int(lens[i:i + batch].max())
+        xb = torch.from_numpy(np.ascontiguousarray(X[i:i + batch, :L])).to(device)
+        mb = torch.arange(L, device=device)[None, :] >= torch.as_tensor(lens[i:i + batch], device=device)[:, None]
+        o = model(xb, mb)
+        acc["anchors"].append(o["anchors"].half().cpu()); acc["hist"].append(o["hist"].float().cpu())
+        acc["cov"].append(o["cov"].float().cpu()); acc["mean"].append(o["mean"].float().cpu())
+    return {k: torch.cat(v).numpy() for k, v in acc.items()}
+
+
+def topic_subset(D: dict, idx) -> dict:
+    return {k: v[idx] for k, v in D.items()}
+
+
+def topic_scores(Q: dict, G: dict, mode: str, device=None, chunk: int = 128) -> np.ndarray:
+    """similarity (nq, NG) of query views Q against game views G (dicts from encode_topics) for one scoring mode:
+
+        routed       sum_k h^q_k omega^g_k cos(a^q_k, a^g_k)            the query's topics, shrunk by the game's coverage:
+                                                                        a topic the game lacks contributes 0 (main score)
+        routed_norm  sum_k h^q_k omega^g_k cos(.) / sum_k h^q_k omega^g_k   renormalised: lacking a topic is not penalised
+        routed_raw   sum_k h^q_k cos(a^q_k, a^g_k)                      no coverage: a lacking game offers the topic prior,
+                                                                        whose unit vector is a hub (reference only)
+        mean         cos(abar^q, abar^g)                                the K = 1 reading
+        hist         sum_k sqrt(h^q_k h^g_k)                            topic distribution only (Bhattacharyya)
+    """
+    dev = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    if mode == "mean":
+        q = F.normalize(torch.as_tensor(np.asarray(Q["mean"], np.float32), device=dev), dim=-1)
+        g = F.normalize(torch.as_tensor(np.asarray(G["mean"], np.float32), device=dev), dim=-1)
+        return (q @ g.T).cpu().numpy()
+    if mode == "hist":
+        q = torch.as_tensor(np.asarray(Q["hist"], np.float32), device=dev).clamp(min=0).sqrt()
+        g = torch.as_tensor(np.asarray(G["hist"], np.float32), device=dev).clamp(min=0).sqrt()
+        return (q @ g.T).cpu().numpy()
+    if mode not in ("routed", "routed_norm", "routed_raw"):
+        raise ValueError(mode)
+    Ga = torch.as_tensor(np.asarray(G["anchors"]), device=dev).float()            # (NG, K, D)
+    Gc = torch.as_tensor(np.asarray(G["cov"], np.float32), device=dev)             # (NG, K)
+    Qa, Qh = Q["anchors"], Q["hist"]
+    nq = Qa.shape[0]
+    out = torch.empty(nq, Ga.shape[0], device=dev)
+    for i in range(0, nq, chunk):
+        q = torch.as_tensor(np.asarray(Qa[i:i + chunk]), device=dev).float()
+        h = torch.as_tensor(np.asarray(Qh[i:i + chunk], np.float32), device=dev)
+        s = torch.einsum("qkd,gkd->qgk", q, Ga)                                    # (chunk, NG, K)
+        if mode == "routed_raw":
+            out[i:i + chunk] = (s * h[:, None, :]).sum(-1)
+        else:
+            w = h[:, None, :] * Gc[None]
+            out[i:i + chunk] = (s * w).sum(-1)
+            if mode == "routed_norm":
+                out[i:i + chunk] /= w.sum(-1).clamp(min=1e-6)
+    return out.cpu().numpy()
+
+
+def topic_retrieval_metrics(Q: dict, G: dict, F_: Fixtures, fold: int, modes=TMODES, device=None) -> dict:
+    """test-fold hit@1 / hit@5 / MRR per variant and mode, validation rank score per mode (selection: routed)"""
+    test, val = F_.fold_games(fold)
+    out = {}
+    for mode in modes:
+        for var in ("neutral", "noname"):
+            q = F_.query_rows(test, var)
+            sim = topic_scores(topic_subset(Q, q), G, mode, device)
+            r = ranks(sim, F_.gA[q])
+            out[f"{mode}_h1_{var}"] = float((r == 1).mean())
+            out[f"{mode}_h5_{var}"] = float((r <= 5).mean())
+            out[f"{mode}_mrr_{var}"] = float((1.0 / r).mean())
+        qv = np.concatenate([F_.query_rows(val, "neutral"), F_.query_rows(val, "noname")])
+        out[f"{mode}_val_rank_score"] = rank_score(topic_scores(topic_subset(Q, qv), G, mode, device), F_.gA[qv])
+    return out
+
+
+def topic_features(G: dict, kind: str, rows=None) -> np.ndarray:
+    """plan section 7: 'mean' (D) unit mean anchor; 'hist' (K) topic distribution; 'mean_hist' (D + K);
+    'concat' (K D) the topic anchors weighted by sqrt(h_k) and flattened: a unit vector whatever the view's length
+    (packs and queries share one scale), whose inner product is sum_k sqrt(h^q_k h^g_k) cos(a^q_k, a^g_k)"""
+    idx = slice(None) if rows is None else np.asarray(rows)
+    if kind == "mean":
+        return l2(G["mean"][idx])
+    if kind == "hist":
+        return np.asarray(G["hist"][idx], np.float32)
+    if kind == "mean_hist":
+        return np.concatenate([l2(G["mean"][idx]), np.asarray(G["hist"][idx], np.float32)], 1)
+    if kind == "concat":
+        a = l2(np.asarray(G["anchors"][idx], np.float32))
+        w = np.sqrt(np.clip(np.asarray(G["hist"][idx], np.float32), 0, None))
+        return (a * w[..., None]).reshape(a.shape[0], -1)
+    raise ValueError(kind)
+
+
+def zeroshot_topics(G: dict, tag_emb: np.ndarray, tag_hist: np.ndarray, F_: Fixtures, fold: int) -> dict:
+    """plan section 8: routed score(n, t) = sum_k h^t_k omega^(n)_k cos(a_k^(n), e_t) with h^t the tag phrase's own
+    topic distribution and omega the game's coverage (a topic the game lacks contributes 0); the design-A max_k
+    reading alongside.  Macro-mAP over tags with positives on the test games."""
+    test, _ = F_.fold_games(fold)
+    gi = np.array(sorted(F_.n2i[n] for n in test))
+    a = l2(np.asarray(G["anchors"][gi], np.float32))                               # (nt, K, D)
+    cov = np.asarray(G["cov"][gi], np.float32)                                      # (nt, K)
+    e = l2(tag_emb)                                                                 # (T, D)
+    s = np.einsum("nkd,td->ntk", a, e)                                              # (nt, T, K)
+    scores = {"routed": (s * np.asarray(tag_hist, np.float32)[None] * cov[:, None, :]).sum(-1), "max": s.max(-1)}
+    y = F_.y[gi]
+    freq = F_.y.sum(0)
+    order = np.argsort(freq)
+    bands = {"low": order[: len(order) // 3], "mid": order[len(order) // 3: 2 * len(order) // 3], "high": order[2 * len(order) // 3:]}
+    out = {}
+    for name, sc in scores.items():
+        aps = np.array([average_precision(y[:, t], sc[:, t]) for t in range(y.shape[1])])
+        out[f"macro_map_{name}"] = float(np.nanmean(aps))
+        out[f"ap_{name}"] = {F_.tag_names[t]: (None if np.isnan(aps[t]) else float(aps[t])) for t in range(len(aps))}
+        for b, ids in bands.items():
+            out[f"map_{b}_{name}"] = float(np.nanmean(aps[ids]))
+    out["tag_topics"] = {F_.tag_names[t]: [int(k) for k in np.argsort(-tag_hist[t])[:3]] for t in range(len(F_.tag_names))}
+    return out

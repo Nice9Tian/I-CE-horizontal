@@ -145,3 +145,106 @@ def monitors(M_w, mask_w, tw, M_s, mask_s, ds, a_s, a_w, ts=None) -> dict:
     out["xgame_nn_frac_gt09"] = float((nn_ > 0.9).float().mean())
     out["xgame_nn_frac_lt05"] = float((nn_ < 0.5).float().mean())
     return out
+
+
+# ============================================================================ design B: topic-routed losses (plan 4.1, 4.3)
+def routed_ice_loss(zs, mask_s, M_s, a_w, cov_w, a_s=None, cov_s=None, *, tau: float, margin: float, sigma: float,
+                    own_neg: bool = True, neg_cov: bool = True):
+    """Design B's I-CE.  zs: strong-view elements (B, Ns, D) in the anchors' space (centred); M_s their memberships
+    (used stop-gradient for the positive sets P_i = {k: M > 0.5}, argmax fallback); a_w (B, K, D): the same games'
+    PACK anchors = the positives at the element's topics and the other games' negatives; cov_w (B, K): the packs'
+    topic coverage n / (n + lam) = the positive pair weights omega; a_s / cov_s (B, K, D) / (B, K) or None: the
+    strong-view anchors and their coverage, extra negatives for the OTHER games (never the own game's).
+    neg_cov: every negative is weighted by its own coverage (exp(s/tau) * omega_j), so an anchor that is only the
+    topic prior (an uncovered topic) drops out of the denominator instead of pushing W off the topic centres.
+    own_neg: the own pack's anchors at the topics the element is not in count as negatives.  The negative sum is
+    the same for every positive topic of an element, so it is one logsumexp over the (elements x candidates)
+    matrix.  Returns (loss, stats)."""
+    B, Ns, D = zs.shape
+    K = a_w.shape[1]
+    dev = zs.device
+    use_s = a_s is not None
+    J = (2 if use_s else 1) * B * K
+    with torch.no_grad():
+        zn = F.normalize(zs.float(), dim=-1)
+        zhat = F.normalize(zn + sigma * torch.randn_like(zn), dim=-1) if sigma > 0 else zn
+        valid = ~mask_s
+        Ms = M_s.detach()
+        P = Ms > 0.5
+        none = (~P.any(-1)) & valid
+        if none.any():
+            P = P | (F.one_hot(Ms.argmax(-1), K).bool() & none[..., None])
+        P = P & valid[..., None]                                                    # (B, Ns, K)
+        omega = cov_w.detach().float()[:, None, :] * P.float()                      # (B, Ns, K)
+        game = torch.arange(B, device=dev)
+        cand_game = (torch.arange(J, device=dev) // K) % B                          # (J,) game of candidate j
+        same = cand_game[None, :] == game[:, None]                                  # (B, J)
+        is_weak = torch.arange(J, device=dev) < B * K
+        excl = (same & ~is_weak[None, :])[:, None, :].expand(B, Ns, J).clone()      # the own strong anchors never count
+        if own_neg:
+            for b in range(B):
+                excl[b, :, b * K:(b + 1) * K] = P[b]                                # own pack: only the positive topics drop out
+        else:
+            excl |= (same & is_weak[None, :])[:, None, :]                           # own pack entirely out of the negatives
+        if neg_cov:
+            cov_j = cov_w.detach().float().reshape(-1)
+            if use_s:
+                cov_j = torch.cat([cov_j, (cov_s if cov_s is not None else torch.ones(B, K, device=dev)).detach().float().reshape(-1)])
+            logw = torch.log(cov_j.clamp(min=1e-6))                                 # (J,)
+        else:
+            logw = torch.zeros(J, device=dev)
+    cands = a_w.reshape(B * K, D) if not use_s else torch.cat([a_w.reshape(B * K, D), a_s.reshape(B * K, D)], 0)
+    sims = torch.einsum("bnd,jd->bnj", zhat, cands)                                 # (B, Ns, J)
+    pos = torch.stack([sims[b, :, b * K:(b + 1) * K] for b in range(B)])            # (B, Ns, K): the own pack's anchors
+    lse_neg = torch.logsumexp((sims / tau + logw).masked_fill(excl, float("-inf")), dim=-1)   # (B, Ns)
+    logit_pos = (pos - margin) / tau
+    nll = torch.logaddexp(logit_pos, lse_neg[..., None]) - logit_pos                # -log p_ik
+    wsum = omega.sum().clamp(min=1e-6)
+    loss = (nll * omega).sum() / wsum
+    with torch.no_grad():
+        stats = {"pos_prob": float((torch.exp(-nll) * omega).sum() / wsum),
+                 "pos_cos": float((pos * omega).sum() / wsum),
+                 "n_pos_per_elem": float(P.sum(-1)[valid].float().mean()) if valid.any() else 0.0,
+                 "pos_cov": float((cov_w.detach()[:, None, :] * P).sum() / P.sum().clamp(min=1))}
+    return loss, stats
+
+
+def routed_inv_loss(a_s, a_w, h_s, cov_w):
+    """plan 4.3: 1 - cos(a^s_k, sg(a^w_k)) over the topics both views talk about, weights h^s_k cov^w_k (stop-gradient)"""
+    w = (h_s * cov_w).detach().float()
+    return (((1.0 - (a_s * a_w.detach()).sum(-1)) * w).sum() / w.sum().clamp(min=1e-6))
+
+
+def _eff_topics(h: torch.Tensor) -> torch.Tensor:
+    """exp(entropy) of each row of a distribution matrix"""
+    p = h.clamp(min=1e-9)
+    return torch.exp(-(p * p.log()).sum(-1))
+
+
+@torch.no_grad()
+def topic_monitors(ow: dict, os_: dict, mask_w, mask_s, ts, model, l_inv: float) -> dict:
+    """plan section 10 for design B, on one batch.  ow / os_: the aggregate dicts (with M) of the pack and strong views;
+    ts (B, Ns) element types of the strong view (0 = review) or None; model: the TopicCodebook (prototype stats)."""
+    a = ow["anchors"]
+    B, K, _ = a.shape
+    dev = a.device
+    out = {"eff_topics_w": float(_eff_topics(ow["hist"]).mean())}
+    e_s = _eff_topics(os_["hist"])
+    review = torch.ones(B, dtype=torch.bool, device=dev) if ts is None else torch.as_tensor(np.asarray(ts)[:, 0] == 0, device=dev)
+    out["eff_topics_s_review"] = float(e_s[review].mean()) if review.any() else float("nan")
+    out["eff_topics_s_doc"] = float(e_s[~review].mean()) if (~review).any() else float("nan")
+    out["topics_per_elem_w"] = float((ow["M"] > 0.5).sum(-1)[~mask_w].float().mean())
+    out["topics_per_elem_s"] = float((os_["M"] > 0.5).sum(-1)[~mask_s].float().mean()) if (~mask_s).any() else 0.0
+    out["cov_mean_w"] = float(ow["cov"].mean())
+    out["topics_covered_w"] = float((ow["cov"] > 0.5).float().sum(-1).mean())
+    out["stability"] = 1.0 - float(l_inv)
+    cov = ow["cov"] > 0.5                                                           # (B, K)
+    g_k = torch.einsum("bkd,ckd->kbc", a, a)                                        # (K, B, B) same topic, two games
+    pair = cov.T[:, :, None] & cov.T[:, None, :] & ~torch.eye(B, dtype=torch.bool, device=dev)[None]
+    out["xgame_same_topic_cos"] = float(g_k[pair].mean()) if pair.any() else float("nan")
+    g_b = torch.einsum("bkd,bjd->bkj", a, a)                                        # (B, K, K) same game, two topics
+    pair2 = cov[:, :, None] & cov[:, None, :] & ~torch.eye(K, dtype=torch.bool, device=dev)[None]
+    out["xtopic_same_game_cos"] = float(g_b[pair2].mean()) if pair2.any() else float("nan")
+    out.update(model.proto_stats())
+    out.update(balance_err_max=model.last_balance_err[0], balance_err_mean=model.last_balance_err[1])
+    return out

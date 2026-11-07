@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Checkpoint selection after the fact (for runs trained with --no-eval): encode the cached draw 0 and
-the wiki queries with every saved checkpoint, score the validation fold with the paper's rank rule
-(slot scoring), and write runs/<name>/selection.json plus one eval.jsonl line per checkpoint.
+"""Checkpoint selection after the fact (for runs trained with --no-eval): encode the cached draw 0 and the wiki queries
+with every saved checkpoint, score the validation fold with the paper's rank rule (routed scoring for design B, slot
+for A), and write runs/<name>/selection.json plus one eval.jsonl line per checkpoint.
 
-    python scripts/select_ckpt.py --run runs/k6_fold0 [--cap 512] [--steps 1000,2000,...]
+    python scripts/select_ckpt.py --run runs/b64_frozen [--cap 512] [--steps 1000,2000,...]
 """
 import argparse
 import json
@@ -16,15 +16,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, load_draw  # noqa: E402
-from ice_h.evaluate import encode_queries, encode_sets, retrieval_metrics  # noqa: E402
-from ice_h.model import LatentArray  # noqa: E402
-
-
-def build(a, dev):
-    return LatentArray(K=a["K"], d_model=a["d_model"], heads=a["heads"], rounds=a["rounds"], dropout=a["dropout"], c=a["c"],
-                       eps=a["eps"], sinkhorn_iters=a["sinkhorn_iters"], rho=a["rho"], self_attn=a.get("self_attn", False),
-                       ot=a.get("ot", "fermi"),
-                       anchor_mode=a.get("anchor_mode", "decode"), center=a.get("center", False)).to(dev)
+from ice_h.evaluate import encode_queries, encode_sets, encode_topics, retrieval_metrics, topic_retrieval_metrics  # noqa: E402
+from ice_h.runs import build_model, load_state  # noqa: E402
 
 
 def main():
@@ -44,33 +37,36 @@ def main():
     assert ckpts, "no checkpoints"
     F = Fixtures(Path(args.data_dir))
     X0, L0, _, _ = load_draw(args.cap, 0, Path(args.cache_dir)); X0 = np.ascontiguousarray(X0)
-    sel_path = run / "selection.json"
+    SQ, _ = F.queries_std()
     selection = {"best_step": None, "best_score": -1.0, "scores": {}}           # recomputed from scratch for the checkpoints scored here
     model = None
     with open(run / "eval.jsonl", "a", encoding="utf-8") as ef:
         for p in ckpts:
             ck = torch.load(p, map_location="cpu", weights_only=False)
+            a = ck["args"]
+            design = a.get("design", "A")
             if model is None:
-                model = build(ck["args"], dev)
-                fold = ck["args"]["fold"]
-            sd = dict(ck["model"])
-            if "W.weight" in sd:
-                w = sd.pop("W.weight"); sd["dW.weight"] = w - torch.eye(w.shape[0])
-            model.load_state_dict({k: v for k, v in sd.items() if k in model.state_dict()}, strict=False); model.eval()
+                model = build_model(a, dev)
+                fold = a["fold"]
+            load_state(model, ck["model"], design); model.eval()
             t0 = time.time()
-            G = encode_sets(model, X0, L0, dev); Q = encode_queries(model, F, dev)
-            m = retrieval_metrics(Q, G, F, fold, device=dev)
+            if design == "B":
+                m = topic_retrieval_metrics(encode_topics(model, SQ, F.QL, dev, batch=128), encode_topics(model, X0, L0, dev), F, fold, device=dev)
+                score = m["routed_val_rank_score"]
+                line = f"routed h1 name {m['routed_h1_neutral']:.3f} stripped {m['routed_h1_noname']:.3f} | mean {m['mean_h1_noname']:.3f} hist {m['hist_h1_noname']:.3f}"
+            else:
+                m = retrieval_metrics(encode_queries(model, F, dev), encode_sets(model, X0, L0, dev), F, fold, device=dev)
+                score = m["slot_val_rank_score"]
+                line = f"slot h1 name {m['slot_h1_neutral']:.3f} stripped {m['slot_h1_noname']:.3f} | mean {m['mean_h1_noname']:.3f} chamfer {m['chamfer_h1_noname']:.3f}"
             step = int(ck["step"])
             rec = {"step": step, **{k: round(v, 4) for k, v in m.items()}, "sec": round(time.time() - t0, 1), "source": "select_ckpt"}
             ef.write(json.dumps(rec) + "\n"); ef.flush()
-            score = m["slot_val_rank_score"]
             selection["scores"][str(step)] = score
             if score > selection["best_score"] or (score == selection["best_score"] and selection["best_step"] is not None and step < selection["best_step"]):
                 selection.update(best_step=step, best_score=score)
-            print(f"step {step:6d}: val rank {score:8.2f} | test slot h1 name {m['slot_h1_neutral']:.3f} stripped {m['slot_h1_noname']:.3f} "
-                  f"| mean {m['mean_h1_noname']:.3f} chamfer {m['chamfer_h1_noname']:.3f}", flush=True)
-    sel_path.write_text(json.dumps(selection, indent=1), encoding="utf-8")
-    print("best step", selection["best_step"], "score", round(selection["best_score"], 2), "->", sel_path)
+            print(f"step {step:6d}: val rank {score:8.2f} | test {line}", flush=True)
+    (run / "selection.json").write_text(json.dumps(selection, indent=1), encoding="utf-8")
+    print("best step", selection["best_step"], "score", round(selection["best_score"], 2), "->", run / "selection.json")
 
 
 if __name__ == "__main__":

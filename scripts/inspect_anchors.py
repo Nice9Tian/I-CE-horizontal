@@ -20,9 +20,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, FullPool, load_draw  # noqa: E402
 from ice_h.evaluate import l2  # noqa: E402
-
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from eval_run import load_model  # noqa: E402
+from ice_h.runs import load_model  # noqa: E402
 
 TEXT_H5 = r"D:\studable query latent\game_review_data\build_new_gamedata\text_h5.h5"
 

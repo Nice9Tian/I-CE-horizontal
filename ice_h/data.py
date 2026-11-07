@@ -410,3 +410,18 @@ def load_draw(cap: int, k: int, cache_dir: Path | None = None):
     assert prog["done"] == prog["NG"], f"draw cache at {d} is incomplete ({prog['done']}/{prog['NG']})"
     return (np.load(d / f"draw{k}.npy", mmap_mode="r"), np.load(d / f"len{k}.npy"), np.load(d / f"rows{k}.npy"),
             np.load(d / "doclen.npy"))
+
+
+def sample_pool_rows(POOL, plen, games, n_games: int = 400, per_game: int = 500, seed: int = 0) -> np.ndarray:
+    """a sample of standardised pool sentences of the training games, ``per_game`` random rows from each of
+    ``n_games`` random games (the codebook initialisation): float32 (n, D)"""
+    rng = np.random.default_rng(seed)
+    sel = rng.choice(np.asarray(games), min(n_games, len(games)), replace=False)
+    out = []
+    for g in sel:
+        n = int(plen[int(g)])
+        if n == 0:
+            continue
+        rows = np.sort(rng.choice(n, min(per_game, n), replace=False))
+        out.append(np.asarray(POOL[int(g)][rows], dtype=np.float32))
+    return np.concatenate(out)
