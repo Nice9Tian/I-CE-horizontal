@@ -16,7 +16,7 @@ mkdir -p "$D" "$ROOT/cache"
 cd "$ROOT"
 [ -d I-CE-horizontal ] || git clone --depth 1 https://github.com/Nice9Tian/I-CE-horizontal.git
 [ -d I2CE-GameRepresention-by-SteamReviews ] || git clone --depth 1 https://github.com/Nice9Tian/I2CE-GameRepresention-by-SteamReviews.git
-python -m pip install -q "huggingface_hub>=0.34" numpy scipy scikit-learn h5py pytest
+python -m pip install -q "huggingface_hub>=0.34" numpy scipy scikit-learn h5py pytest sentence-transformers
 hfget() { hf download "$REPO" "$@" --repo-type dataset --revision "$REV" --local-dir "$D"; }
 echo "== small and medium files"
 hfget games.npz wiki_eval_split.json sp_raw_views.npz wiki_clean_views.npz wiki_eval.npz tag_labels.npz \
