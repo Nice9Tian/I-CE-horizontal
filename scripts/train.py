@@ -57,7 +57,8 @@ def parse():
     ap.add_argument("--gain-init", type=float, default=3.0)
     ap.add_argument("--gain-min", type=float, default=2.0)
     ap.add_argument("--gain-max", type=float, default=8.0)
-    ap.add_argument("--freeze-gain", action="store_true", help="keep the affinity gain at its initial value (B-frozen, B0, B3)")
+    ap.add_argument("--freeze-gain", action="store_true", help="keep the affinity gain fixed even when the prototypes learn")
+    ap.add_argument("--learn-gain", action="store_true", help="learn the gain even while the prototypes stay frozen")
     ap.add_argument("--no-implicit-grad", action="store_true", help="ablation: stop the gradient of the row duals (no conservation)")
     ap.add_argument("--protos", default="kmeans", choices=["kmeans", "random"], help="codebook initialisation")
     ap.add_argument("--kmeans-games", type=int, default=400)
@@ -224,8 +225,10 @@ def main():
         groups = [{"params": decay, "weight_decay": args.wd, "mult": 1.0}, {"params": others, "weight_decay": 0.0, "mult": 1.0},
                   {"params": [named["protos"]], "weight_decay": 0.0, "mult": args.proto_lr_mult}]
         model.protos.requires_grad_(args.freeze_protos == 0)
-        if args.freeze_gain:
-            model.gain.requires_grad_(False)
+        # the gain follows the prototypes' schedule (B-frozen: both fixed; B-learn: both learn after the warm-up)
+        gain_learns = args.learn_gain or (args.freeze_protos != -1 and not args.freeze_gain)
+        gain_now = args.learn_gain or (gain_learns and args.freeze_protos == 0)
+        model.gain.requires_grad_(gain_now)
     opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.98))
 
     # ---- evaluation assets: draw 0 at the training budget (memory-mapped) and the standardised queries
@@ -271,7 +274,9 @@ def main():
             gp["lr"] = lr_at(step - 1, args) * gp.get("mult", 1.0)
         if args.design == "B" and args.freeze_protos > 0 and step == args.freeze_protos + 1:
             model.protos.requires_grad_(True)
-            log({"event": "protos_unfrozen", "step": step})
+            if gain_learns:
+                model.gain.requires_grad_(True)
+            log({"event": "protos_unfrozen", "step": step, "gain_learns": gain_learns})
         batch = pref.next()
         l_ice, l_inv, st, aux = step_fn(model, batch, args, dev)
         loss = l_ice + args.lam_inv * l_inv
@@ -281,6 +286,8 @@ def main():
         opt.step()
         run = {}
         if args.design == "B":
+            with torch.no_grad():
+                model.gain.clamp_(model.gain_min, model.gain_max)                 # projection: a clamped parameter would lose its gradient at the bound
             run = model.update_running(aux["mask"], aux["x"], aux["M"], g_star=aux["g"])
         for k, v in {"loss": float(loss), "ice": float(l_ice), "inv": float(l_inv), "gn": float(gn), **st}.items():
             ema[k] = v if k not in ema else 0.9 * ema[k] + 0.1 * v

@@ -3,7 +3,7 @@
 
     python scripts/eval_run.py --run runs/b64_frozen [--step best] --cap 512 --draws 10 --cache-dir D:/ice_horizontal_cache
 
-Design B (topic codebook), per draw: retrieval hit@1 / hit@5 for the four scorings (routed, routed_cov, mean, hist)
+Design B (topic codebook), per draw: retrieval hit@1 / hit@5 for the five scorings (routed, routed_norm, routed_raw, mean, hist)
 on the test fold; the ridge tag probe on the mean (F1), topic-distribution (F2), mean+hist and, for K <= 64, the
 coverage-weighted topic concatenation (F3); the zero-shot tag mAP (routed and max readings); the frozen baseline B1
 (raw mean, the paper's reading) and B1' (centred mean).  Design A keeps its previous evaluation (slot / mean /
@@ -101,8 +101,8 @@ def main():
                         rf["zs_map"] = zeroshot_single(Gf, tag_emb, F, fold)["macro_map"]
                         rf["zs_map_c"] = zeroshot_single(Gf - mu, tag_emb - mu, F, fold)["macro_map"]
                 rows_froz.append(rf)
-            print(f"draw {d}: routed h1 name {r['routed_h1_neutral']:.3f} stripped {r['routed_h1_noname']:.3f} | cov {r['routed_cov_h1_noname']:.3f} "
-                  f"mean {r['mean_h1_noname']:.3f} hist {r['hist_h1_noname']:.3f}"
+            print(f"draw {d}: routed h1 name {r['routed_h1_neutral']:.3f} stripped {r['routed_h1_noname']:.3f} | norm {r['routed_norm_h1_noname']:.3f} "
+                  f"raw {r['routed_raw_h1_noname']:.3f} mean {r['mean_h1_noname']:.3f} hist {r['hist_h1_noname']:.3f}"
                   + (f" | tag {r.get('tag_f1_mean', float('nan')):.3f}/{r.get('tag_f1_hist', float('nan')):.3f}/{r.get('tag_f1_mean_hist', float('nan')):.3f}"
                      + (f"/{r['tag_f1_concat']:.3f}" if 'tag_f1_concat' in r else "") if not args.no_tags else "")
                   + (f" | zs {r['zs_map_routed']:.3f}/{r['zs_map_max']:.3f}" if 'zs_map_routed' in r else "") + f"  [{(time.time() - t0) / 60:.1f} min]", flush=True)
