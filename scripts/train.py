@@ -27,7 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from ice_h.codebook import TopicCodebook  # noqa: E402
 from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, load_draw, pool_global_mean, sample_pool_rows  # noqa: E402
 from ice_h.evaluate import encode_queries, encode_sets, encode_topics, retrieval_metrics, topic_retrieval_metrics  # noqa: E402
-from ice_h.losses import ice_loss, inv_loss, monitors, routed_ice_loss, routed_inv_loss, topic_monitors  # noqa: E402
+from ice_h.losses import ice_loss, inv_loss, monitors, routed_anchor_loss, routed_ice_loss, routed_inv_loss, topic_monitors  # noqa: E402
 from ice_h.model import LatentArray  # noqa: E402
 
 
@@ -72,6 +72,8 @@ def parse():
     ap.add_argument("--no-own-neg", action="store_true", help="the own pack's other-topic anchors are not negatives")
     ap.add_argument("--no-strong-neg", action="store_true", help="the other games' strong-view anchors are not negatives")
     ap.add_argument("--no-neg-cov", action="store_true", help="ablation: negatives not weighted by their coverage")
+    ap.add_argument("--loss-level", default="sentence", choices=["sentence", "anchor", "both"],
+                    help="routed I-CE on the strong view's sentences (plan 4.1), on its topic anchors (view level, the original I-CE's structure), or both")
     # design A
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--d-model", type=int, default=256)
@@ -159,9 +161,17 @@ def step_B(model, batch, args, dev):
         ow = model.aggregate(xw_c, mw, M_w)
     M_s = model.membership(S_s, ms, g)
     os_ = model.aggregate(xs_c, ms, M_s)
-    l_ice, st = routed_ice_loss(xs_c, ms, M_s, ow["anchors"], ow["cov"], None if args.no_strong_neg else os_["anchors"],
-                                None if args.no_strong_neg else os_["cov"], tau=args.tau, margin=args.margin, sigma=args.sigma,
-                                own_neg=not args.no_own_neg, neg_cov=not args.no_neg_cov)
+    st = {}
+    l_ice = torch.zeros((), device=dev)
+    if args.loss_level in ("sentence", "both"):
+        l_ice, st = routed_ice_loss(xs_c, ms, M_s, ow["anchors"], ow["cov"], None if args.no_strong_neg else os_["anchors"],
+                                    None if args.no_strong_neg else os_["cov"], tau=args.tau, margin=args.margin, sigma=args.sigma,
+                                    own_neg=not args.no_own_neg, neg_cov=not args.no_neg_cov)
+    if args.loss_level in ("anchor", "both"):
+        l_a, st_a = routed_anchor_loss(os_["anchors"], os_["cov"], os_["hist"], ow["anchors"], ow["cov"], tau=args.tau, margin=args.margin,
+                                       own_neg=not args.no_own_neg, use_strong_neg=not args.no_strong_neg)
+        l_ice = l_ice + l_a
+        st.update(st_a)
     l_inv = routed_inv_loss(os_["anchors"], ow["anchors"], os_["hist"], ow["cov"])
     ow["M"], os_["M"] = M_w, M_s
     return l_ice, l_inv, st, {"S": [S_w, S_s], "mask": [mw, ms], "x": [xw_c, xs_c], "M": [M_w, M_s], "g": g,

@@ -209,6 +209,45 @@ def routed_ice_loss(zs, mask_s, M_s, a_w, cov_w, a_s=None, cov_s=None, *, tau: f
     return loss, stats
 
 
+def routed_anchor_loss(a_s, cov_s, h_s, a_w, cov_w, *, tau: float, margin: float, own_neg: bool = True, use_strong_neg: bool = True):
+    """The view-level routed I-CE (the original I-CE's structure lifted to topics): the strong view's topic anchor
+    a^{s,b}_k is the query, its positive is the same game's pack anchor a^{w,b}_k, the negatives are the other games'
+    pack anchors (all topics) and strong anchors, each weighted by its coverage, plus the own pack's other topics
+    (own_neg).  Pair weights h^s_bk omega^w_bk (stop-gradient), as in the invariance term.  Returns (loss, stats)."""
+    B, K, D = a_s.shape
+    dev = a_s.device
+    J = (2 if use_strong_neg else 1) * B * K
+    with torch.no_grad():
+        w = (h_s * cov_w).float()                                                      # (B, K) pair weights
+        cov_j = cov_w.float().reshape(-1)
+        if use_strong_neg:
+            cov_j = torch.cat([cov_j, cov_s.float().reshape(-1)])
+        logw = torch.log(cov_j.clamp(min=1e-6))                                        # (J,)
+        game_q = torch.arange(B, device=dev).repeat_interleave(K)                      # (BK,) game of each query anchor
+        cand_game = (torch.arange(J, device=dev) // K) % B
+        is_weak = torch.arange(J, device=dev) < B * K
+        same = cand_game[None, :] == game_q[:, None]                                    # (BK, J)
+        excl = same & ~is_weak[None, :]                                                # own strong anchors never count
+        own_pos = torch.zeros(B * K, J, dtype=torch.bool, device=dev)
+        own_pos[torch.arange(B * K, device=dev), torch.arange(B * K, device=dev)] = True   # own pack anchor at the same topic
+        excl |= own_pos
+        if not own_neg:
+            excl |= same & is_weak[None, :]
+    cands = a_w.reshape(B * K, D) if not use_strong_neg else torch.cat([a_w.reshape(B * K, D), a_s.reshape(B * K, D)], 0)
+    q = a_s.reshape(B * K, D)
+    sims = q @ cands.T                                                                  # (BK, J)
+    pos = (q * a_w.reshape(B * K, D)).sum(-1)                                           # (BK,)
+    lse_neg = torch.logsumexp((sims / tau + logw).masked_fill(excl, float("-inf")), dim=-1)
+    logit_pos = (pos - margin) / tau
+    nll = torch.logaddexp(logit_pos, lse_neg) - logit_pos
+    wf = w.reshape(-1)
+    wsum = wf.sum().clamp(min=1e-6)
+    loss = (nll * wf).sum() / wsum
+    with torch.no_grad():
+        stats = {"apos_prob": float((torch.exp(-nll) * wf).sum() / wsum), "apos_cos": float((pos * wf).sum() / wsum)}
+    return loss, stats
+
+
 def routed_inv_loss(a_s, a_w, h_s, cov_w):
     """plan 4.3: 1 - cos(a^s_k, sg(a^w_k)) over the topics both views talk about, weights h^s_k cov^w_k (stop-gradient)"""
     w = (h_s * cov_w).detach().float()
