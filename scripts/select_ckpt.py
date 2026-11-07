@@ -52,8 +52,8 @@ def main():
             t0 = time.time()
             if design == "B":
                 m = topic_retrieval_metrics(encode_topics(model, SQ, F.QL, dev, batch=128), encode_topics(model, X0, L0, dev), F, fold, device=dev)
-                score = m["routed_val_rank_score"]
-                line = f"routed h1 name {m['routed_h1_neutral']:.3f} stripped {m['routed_h1_noname']:.3f} | mean {m['mean_h1_noname']:.3f} hist {m['hist_h1_noname']:.3f}"
+                score = m["routed_norm_val_rank_score"]
+                line = f"routed_norm h1 name {m['routed_norm_h1_neutral']:.3f} stripped {m['routed_norm_h1_noname']:.3f} | shrink {m['routed_h1_noname']:.3f} mean {m['mean_h1_noname']:.3f} hist {m['hist_h1_noname']:.3f}"
             else:
                 m = retrieval_metrics(encode_queries(model, F, dev), encode_sets(model, X0, L0, dev), F, fold, device=dev)
                 score = m["slot_val_rank_score"]

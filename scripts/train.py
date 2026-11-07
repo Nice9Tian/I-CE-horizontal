@@ -242,7 +242,7 @@ def main():
         SQ, _ = F.queries_std()
         log({"event": "draw0_loaded", "shape": list(X0.shape), "sec": round(time.time() - t0, 1)})
     selection = {"best_step": None, "best_score": -1.0, "scores": {}}
-    sel_key = "routed_val_rank_score" if args.design == "B" else "slot_val_rank_score"
+    sel_key = "routed_norm_val_rank_score" if args.design == "B" else "slot_val_rank_score"   # B: the coverage-renormalised routed score (plan 6)
 
     def save_ckpt(step):
         torch.save({"model": model.state_dict(), "args": vars(args), "step": step}, out / f"ckpt_step{step}.pt")
