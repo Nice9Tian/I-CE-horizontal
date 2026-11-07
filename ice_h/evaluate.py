@@ -155,16 +155,29 @@ def _ridge_tools():
     return micro_prf, train_anchor_ridge
 
 
-def tag_probe(F_: Fixtures, fold: int, Gfeat: np.ndarray, Qfeat_by_row: dict) -> dict:
+CONCAT_ALPHAS = (0.01, 0.1, 0.3, 1.0, 3.0, 10.0, 30.0, 100.0, 300.0, 1000.0, 3000.0, 10000.0, 30000.0, 100000.0)
+
+
+def tag_probe(F_: Fixtures, fold: int, Gfeat: np.ndarray, Qfeat_by_row: dict, alphas=None) -> dict:
     """ridge on training-pool anchor features -> micro-F1 on the test games' neutral query features.
 
-    Gfeat (NG, d); Qfeat_by_row maps a wiki_eval row index to its (d,) feature (neutral test rows needed)."""
+    Gfeat (NG, d); Qfeat_by_row maps a wiki_eval row index to its (d,) feature (neutral test rows needed).
+    alphas: the paper's grid (0.01 ... 1000) by default; the 65,536-dimensional F3 feature gets CONCAT_ALPHAS, the
+    same grid extended upward (after column standardisation the trace of the Gram matrix scales with d, so the
+    paper's upper bound 1000 under-regularises at d = 65,536); the choice stays on the validation games."""
     from types import SimpleNamespace
     micro_prf, train_anchor_ridge = _ridge_tools()
+    import VICReg_review.text_variant_eval as tve
     test, val = F_.fold_games(fold)
     split = {"train": [n for n in F_.names if n not in test | val], "val": sorted(val), "test": sorted(test)}
     targs = SimpleNamespace(tag_text_train_frac=0.7, tag_text_val_frac=0.15, tag_text_split_seed=42, seed=42, tag_text_threshold_steps=33)
-    sc, rg, alpha, th, vm = train_anchor_ridge(targs, Gfeat.astype(np.float32), F_.y, F_.n2i, split)
+    old = tve.DEFAULT_ALPHAS
+    if alphas is not None:
+        tve.DEFAULT_ALPHAS = tuple(alphas)
+    try:
+        sc, rg, alpha, th, vm = train_anchor_ridge(targs, Gfeat.astype(np.float32), F_.y, F_.n2i, split)
+    finally:
+        tve.DEFAULT_ALPHAS = old
     ti = F_.query_rows(test, "neutral")
     Xq = np.stack([Qfeat_by_row[int(i)] for i in ti]).astype(np.float32)
     lab = np.stack([F_.y[F_.n2i[F_.art[i]]] for i in ti])

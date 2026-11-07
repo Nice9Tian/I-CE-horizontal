@@ -50,6 +50,7 @@ def main():
                 if "frozen" in m and "h1_neutral_c" in m["frozen"]:
                     fz = m["frozen"]
                     rows.append(("B1' 中心化均值", cap, {"h1_neutral": fz["h1_neutral_c"], "h5_neutral": fz["h5_neutral_c"], "h1_noname": fz["h1_noname_c"], "h5_noname": fz["h5_noname_c"], "zs_map": fz.get("zs_map_c")}))
+                routed_idx = len(rows)
                 for mode, label in (("routed", "话题路由"), ("routed_norm", "路由归一"), ("routed_raw", "路由无覆盖"), ("mean", "均值"), ("hist", "话题分布")):
                     r = {k: mm.get(f"{mode}_{k}") for k in ("h1_neutral", "h5_neutral", "h1_noname", "h5_noname")}
                     if mode == "routed":
@@ -57,7 +58,7 @@ def main():
                                  tag_f1_concat=mm.get("tag_f1_concat"), zs_map=mm.get("zs_map_routed"))
                     rows.append((f"设计 B {name}（K={K}，{label}）step {m['step']}", cap, r))
                 if mm.get("zs_map_max"):
-                    rows[-5] = (rows[-5][0] + f"；零样本 max 读法 {fmt(mm['zs_map_max'])}", rows[-5][1], rows[-5][2])
+                    rows[routed_idx] = (rows[routed_idx][0] + f"；零样本 max 读法 {fmt(mm['zs_map_max'])}", rows[routed_idx][1], rows[routed_idx][2])
             else:
                 for mode, label in (("slot", "槽位余弦"), ("mean", "均值池化"), ("chamfer", "Chamfer")):
                     r = {k: mm.get(f"{mode}_{k}") for k in ("h1_neutral", "h5_neutral", "h1_noname", "h5_noname")}

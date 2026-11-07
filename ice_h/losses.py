@@ -230,12 +230,18 @@ def topic_monitors(ow: dict, os_: dict, mask_w, mask_s, ts, model, l_inv: float)
     dev = a.device
     out = {"eff_topics_w": float(_eff_topics(ow["hist"]).mean())}
     e_s = _eff_topics(os_["hist"])
-    review = torch.ones(B, dtype=torch.bool, device=dev) if ts is None else torch.as_tensor(np.asarray(ts)[:, 0] == 0, device=dev)
+    nonempty = (~mask_s).any(1)                                                     # an empty strong view is neither kind
+    if ts is None:
+        review, doc = nonempty, torch.zeros_like(nonempty)
+    else:
+        t0 = torch.as_tensor(np.asarray(ts)[:, 0] if np.asarray(ts).shape[1] else np.full(B, -1), device=dev)
+        review, doc = nonempty & (t0 == 0), nonempty & (t0 > 0)
     out["eff_topics_s_review"] = float(e_s[review].mean()) if review.any() else float("nan")
-    out["eff_topics_s_doc"] = float(e_s[~review].mean()) if (~review).any() else float("nan")
+    out["eff_topics_s_doc"] = float(e_s[doc].mean()) if doc.any() else float("nan")
     out["topics_per_elem_w"] = float((ow["M"] > 0.5).sum(-1)[~mask_w].float().mean())
     out["topics_per_elem_s"] = float((os_["M"] > 0.5).sum(-1)[~mask_s].float().mean()) if (~mask_s).any() else 0.0
-    out["cov_mean_w"] = float(ow["cov"].mean())
+    has_mass = ow["mass"] > 1.0
+    out["cov_mean_w"] = float(ow["cov"][has_mass].mean()) if has_mass.any() else 0.0   # coverage over the topics the pack has mass in
     out["topics_covered_w"] = float((ow["cov"] > 0.5).float().sum(-1).mean())
     out["stability"] = 1.0 - float(l_inv)
     cov = ow["cov"] > 0.5                                                           # (B, K)

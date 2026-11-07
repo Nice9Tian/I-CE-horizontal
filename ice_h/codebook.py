@@ -6,9 +6,11 @@ K global unit prototypes p_k score every sentence x_i = z_i - mu:  S_ik = gain *
     M_ik = sigmoid(S_ik / eps + f_i + g_k),      sum_k M_ik = c,      0 <= M_ik <= 1
 
 is solved PER SENTENCE for its row dual f_i (Fermi-Dirac: entries capped at 1, so c > 1 spreads a sentence over at
-least c topics).  The column duals g are not solved per view: ``g_bar`` is a running estimate (EMA) of the duals that
-equalise the K topic masses over the training stream (solved once per batch on all its sentences, without gradient).
-At evaluation g_bar is frozen, so a sentence's topics depend on the sentence alone, never on the view or the batch.
+least c topics); the first-order dependence of f_i on the logits is put back by the implicit function theorem.  The
+column duals g are not solved per view: ``g_bar`` is a running estimate, moved after every step by a stochastic
+step toward equal topic mass over the training stream (no gradient; --balance batch solves the batch exactly
+instead).  At evaluation g_bar is frozen, so a sentence's topics depend on the sentence alone, never on the view or
+the batch.
 
 A view (pack, strong view, wiki query, tag phrase) is summarised by
 
@@ -47,8 +49,9 @@ def balanced_duals(X: torch.Tensor, c: float, g0: torch.Tensor, iters: int = 10,
     g = g0.detach().float().reshape(1, K).clone()
     for _ in range(iters):
         f = _shift_for_sum(X + g, t_row, dim=1, newton=newton)                    # (N, 1)
-        g = _shift_for_sum(X + f, t_col, dim=0, newton=newton)                    # (1, K)
-        if kappa is not None:                                                      # unbalanced: KKT Newton on the columns
+        if kappa is None:
+            g = _shift_for_sum(X + f, t_col, dim=0, newton=newton)                # (1, K) exact column solve
+        else:                                                                      # unbalanced: KKT Newton on the columns, warm from g
             for _ in range(newton):
                 p_ = torch.sigmoid(X + f + g)
                 tgt = t_col * torch.exp((-kappa * g).clamp(-50.0, 50.0))

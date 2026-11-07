@@ -27,7 +27,7 @@ def load_state(model, sd: dict, design: str):
     sd = dict(sd)
     if "W.weight" in sd:                                                       # design-A checkpoints from before W = I + dW
         w = sd.pop("W.weight")
-        sd["dW.weight"] = w - torch.eye(w.shape[0])
+        sd["dW.weight"] = w - torch.eye(w.shape[0], dtype=w.dtype, device=w.device)
     if design == "B":
         model.load_state_dict(sd, strict=True)                                 # buffers (mu, g_bar, proto_mean) must all be there
     else:

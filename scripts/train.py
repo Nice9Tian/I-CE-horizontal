@@ -4,7 +4,7 @@ design A (the per-game latent array).
 
     python scripts/train.py --name b64_frozen --K 64 --steps 20000                       # B-frozen: k-means prototypes fixed
     python scripts/train.py --name b64_learn  --K 64 --steps 20000 --freeze-protos 1000  # B-learn: prototypes learn after warmup
-    python scripts/train.py --name b64_random --K 64 --steps 0 --protos random           # B3: random codebook, step 0 only
+    python scripts/train.py --name b64_random --K 64 --steps 0 --protos random --gain-init 14 --gain-max 14   # B3: random codebook at a matched logit spread
     python scripts/train.py --design A --name k6 --K 6 --steps 20000                      # design A
 
 Every --eval-every steps (and at step 0 for design B): encode the cached draw 0 (512-sentence packs of all 2,020
@@ -90,8 +90,8 @@ def parse():
     ap.add_argument("--p-doc", type=float, default=0.25)
     ap.add_argument("--batch", type=int, default=64)
     # loss
-    ap.add_argument("--tau", type=float, default=0.03)
-    ap.add_argument("--margin", type=float, default=0.05)
+    ap.add_argument("--tau", type=float, default=None, help="B: 0.03; A: 0.07 (design A's original default)")
+    ap.add_argument("--margin", type=float, default=None, help="B: 0.05; A: 0.15 (design A's original default)")
     ap.add_argument("--lam-inv", type=float, default=1.0)
     ap.add_argument("--sigma", type=float, default=0.01, help="noise std per dim on the unit sphere; 0.01 -> cos about 0.95 before/after")
     # optimisation
@@ -108,6 +108,10 @@ def parse():
     args = ap.parse_args()
     if args.K is None:
         args.K = 64 if args.design == "B" else 6
+    if args.tau is None:
+        args.tau = 0.03 if args.design == "B" else 0.07
+    if args.margin is None:
+        args.margin = 0.05 if args.design == "B" else 0.15
     return args
 
 
@@ -281,6 +285,8 @@ def main():
         l_ice, l_inv, st, aux = step_fn(model, batch, args, dev)
         loss = l_ice + args.lam_inv * l_inv
         opt.zero_grad(set_to_none=True)
+        if not loss.requires_grad:                                                 # every learnable path switched off by the ablation flags
+            raise SystemExit("the loss has no gradient path: check --weak-no-grad / --no-strong-neg / --lam-inv 0 together")
         loss.backward()
         gn = torch.nn.utils.clip_grad_norm_([p for p in model.parameters() if p.requires_grad], args.clip)
         opt.step()
@@ -288,6 +294,8 @@ def main():
         if args.design == "B":
             with torch.no_grad():
                 model.gain.clamp_(model.gain_min, model.gain_max)                 # projection: a clamped parameter would lose its gradient at the bound
+                if model.protos.requires_grad:
+                    model.protos.copy_(torch.nn.functional.normalize(model.protos, dim=-1))   # stay on the sphere: constant effective lr
             run = model.update_running(aux["mask"], aux["x"], aux["M"], g_star=aux["g"])
         for k, v in {"loss": float(loss), "ice": float(l_ice), "inv": float(l_inv), "gn": float(gn), **st}.items():
             ema[k] = v if k not in ema else 0.9 * ema[k] + 0.1 * v
