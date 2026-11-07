@@ -20,16 +20,18 @@ EVAL="--cap 2048 --draws 10 --data-dir $D --cache-dir $ROOT/cache $TAG"
 log "B0 at 2048: k-means codebook, step 0 + evaluation"
 python scripts/train.py --name b64_k0_2048 --steps 0 $TRAIN > "$ROOT/runs_b64_k0_2048.log" 2>&1 && \
 python scripts/eval_run.py --run "$ROOT/runs/b64_k0_2048" --step 0 $EVAL > "$ROOT/runs_b64_k0_2048_eval.log" 2>&1 || log "b64_k0_2048 failed"
-for TAU in 0.05 0.03; do
+# Only the branch that looks promising at 512 is scaled (user's rule): the fixed-pack gallery.  B-frozen and the
+# second tau at 2048 are added later only if the 512 results call for them (GALLERY_TAUS, EXTRA env).
+for TAU in ${GALLERY_TAUS:-0.05}; do
   NAME="b64_gallery2048_t${TAU#0.}"
   log "B-gallery at 2048, tau $TAU: 10k steps + evaluation"
   python scripts/train.py --name "$NAME" --gallery full --tau "$TAU" --steps 10000 --warmup 500 --eval-every 1000 --save-every 1000 $TRAIN > "$ROOT/runs_$NAME.log" 2>&1 && \
   python scripts/eval_run.py --run "$ROOT/runs/$NAME" --step best $EVAL > "$ROOT/runs_${NAME}_eval.log" 2>&1 || log "$NAME failed"
-  if [ "$TAU" = "0.05" ]; then
-    log "B-frozen at 2048: 10k steps + evaluation"
-    python scripts/train.py --name b64_frozen_2048 --steps 10000 --warmup 500 --eval-every 1000 --save-every 1000 $TRAIN > "$ROOT/runs_b64_frozen_2048.log" 2>&1 && \
-    python scripts/eval_run.py --run "$ROOT/runs/b64_frozen_2048" --step best $EVAL > "$ROOT/runs_b64_frozen_2048_eval.log" 2>&1 || log "b64_frozen_2048 failed"
-  fi
 done
+if [ "${EXTRA:-}" = "frozen" ]; then
+  log "B-frozen at 2048: 10k steps + evaluation"
+  python scripts/train.py --name b64_frozen_2048 --steps 10000 --warmup 500 --eval-every 1000 --save-every 1000 $TRAIN > "$ROOT/runs_b64_frozen_2048.log" 2>&1 && \
+  python scripts/eval_run.py --run "$ROOT/runs/b64_frozen_2048" --step best $EVAL > "$ROOT/runs_b64_frozen_2048_eval.log" 2>&1 || log "b64_frozen_2048 failed"
+fi
 cp "$ROOT"/runs/*/eval_cap2048_step*.json "$R/" 2>/dev/null
 log "run_2048 done"
