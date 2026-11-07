@@ -24,6 +24,7 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from ice_h.bank import AnchorBank, fill_bank, routed_bank_loss  # noqa: E402
 from ice_h.codebook import TopicCodebook  # noqa: E402
 from ice_h.data import CACHE_DIR, DATA_DIR, Fixtures, PoolSampler, Prefetcher, load_draw, pool_global_mean, sample_pool_rows  # noqa: E402
 from ice_h.evaluate import encode_queries, encode_sets, encode_topics, retrieval_metrics, topic_retrieval_metrics  # noqa: E402
@@ -74,6 +75,8 @@ def parse():
     ap.add_argument("--no-neg-cov", action="store_true", help="ablation: negatives not weighted by their coverage")
     ap.add_argument("--loss-level", default="sentence", choices=["sentence", "anchor", "both"],
                     help="routed I-CE on the strong view's sentences (plan 4.1), on its topic anchors (view level, the original I-CE's structure), or both")
+    ap.add_argument("--bank", default="none", choices=["none", "ema"], help="ema: EMA anchor bank of all training games as positives and negatives (plan 4.6)")
+    ap.add_argument("--bank-beta", type=float, default=0.05, help="EMA rate of the bank rows (per visit of the game)")
     # design A
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--d-model", type=int, default=256)
@@ -146,6 +149,38 @@ def step_A(model, batch, args, dev):
                          alpha_in=args.alpha_in, alpha_x=args.alpha_x, sigma=args.sigma, decay=not args.no_decay)
     l_inv = inv_loss(os_["anchors"], ow["anchors"])
     return l_ice, l_inv, st, {"ow": ow, "os": os_, "mw": mw, "ms": ms, "xs": xs}
+
+
+def step_B_bank(model, bank, row_of_game, batch, args, dev):
+    """design B with the EMA anchor bank: the pack only updates the bank (no gradient); the strong view's elements
+    (and/or topic anchors) are contrasted against the bank anchors of all training games through the current W"""
+    xw, mw, xs, ms = to_dev(batch, dev)
+    xw_c, xs_c = model.map_space(xw, mw), model.map_space(xs, ms)
+    rows = row_of_game[torch.as_tensor(batch["gids"], device=dev)]
+    with torch.no_grad():
+        S_w = model.affinity(xw_c, mw)
+        M_w = model.membership(S_w, mw)
+        ow = model.aggregate(xw_c, mw, M_w)
+        bank.update(rows, M_w, xw_c)
+    S_s = model.affinity(xs_c, ms)
+    M_s = model.membership(S_s, ms)
+    os_ = model.aggregate(xs_c, ms, M_s)
+    A, cov_A = bank.anchors(model)                                                  # (G, K, D) through the current W
+    st = {}
+    l_ice = torch.zeros((), device=dev)
+    if args.loss_level in ("sentence", "both"):
+        l_ice, st = routed_bank_loss(xs_c, ms, M_s, rows, A, cov_A, rows, tau=args.tau, margin=args.margin, sigma=args.sigma, own_neg=not args.no_own_neg)
+    if args.loss_level in ("anchor", "both"):                                        # the strong view's topic anchors as the elements
+        K = model.K
+        eye = torch.eye(K, device=dev)[None].expand(len(rows), -1, -1)
+        l_a, st_a = routed_bank_loss(os_["anchors"], os_["cov"] <= 0.5, eye, rows, A, cov_A, rows, tau=args.tau, margin=args.margin, sigma=0.0,
+                                     own_neg=not args.no_own_neg)
+        l_ice = l_ice + l_a
+        st.update({"a" + k: v for k, v in st_a.items()})
+    l_inv = routed_inv_loss(os_["anchors"], A[rows].detach(), os_["hist"], cov_A[rows].detach())
+    ow["M"], os_["M"] = M_w, M_s
+    return l_ice, l_inv, st, {"S": [S_w, S_s], "mask": [mw, ms], "x": [xw_c, xs_c], "M": [M_w, M_s], "g": None,
+                              "ow": ow, "os": os_, "mw": mw, "ms": ms, "xs": xs, "S_s": S_s}
 
 
 def step_B(model, batch, args, dev):
@@ -226,6 +261,14 @@ def main():
         np.save(out / "protos_init.npy", model.protos.detach().cpu().numpy())
         log({"event": "codebook_init", **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in init.items()}, "sec": round(time.time() - t0, 1)})
     log({"event": "model", "design": args.design, "params": model.n_params(), "K": args.K})
+    bank = row_of_game = None
+    if args.design == "B" and args.bank == "ema":
+        row_of_game = torch.full((F.NG,), -1, dtype=torch.long, device=dev)
+        row_of_game[torch.as_tensor(idx["train"], device=dev)] = torch.arange(len(idx["train"]), device=dev)
+        bank = AnchorBank(len(idx["train"]), args.K, 1024, beta=args.bank_beta, device=dev)
+        tb = time.time()
+        fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch, log=log)
+        log({"event": "bank_filled", **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
 
     # ---- optimiser
     if args.design == "A":
@@ -282,7 +325,12 @@ def main():
     model.train()
     ema = {}
     ts = time.time()
-    step_fn = step_A if args.design == "A" else step_B
+    if args.design == "A":
+        step_fn = step_A
+    elif bank is not None:
+        step_fn = lambda model, batch, args, dev: step_B_bank(model, bank, row_of_game, batch, args, dev)   # noqa: E731
+    else:
+        step_fn = step_B
     for step in range(1, args.steps + 1):
         for gp in opt.param_groups:
             gp["lr"] = lr_at(step - 1, args) * gp.get("mult", 1.0)
@@ -323,6 +371,8 @@ def main():
                 mon = topic_monitors(aux["ow"], aux["os"], aux["mw"], aux["ms"], batch["ts"], model, float(l_inv))
                 mon.update(run)
                 mon["s_std"] = float(aux["S_s"][~aux["ms"]].std())
+                if bank is not None:
+                    mon.update(bank.stats())
             log({"step": step, "monitor": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in mon.items()}})
         do_eval = not args.no_eval and (step % args.eval_every == 0 or step == args.steps)
         if step % args.save_every == 0 or step == args.steps or do_eval:
@@ -331,6 +381,8 @@ def main():
             evaluate(step)
     if pref is not None:
         pref.close()
+    if bank is not None:
+        torch.save(bank.state_dict(), out / "bank_final.pt")
     if selection["best_step"] is None and args.design == "B":
         selection.update(best_step=0, best_score=float("nan"))
         (out / "selection.json").write_text(json.dumps(selection, indent=1), encoding="utf-8")
