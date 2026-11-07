@@ -164,6 +164,10 @@ class PoolSampler:
         self.F, self.cap, self.ns_min, self.ns_max, self.p_doc = F, cap, ns_min, ns_max, p_doc
         self.train_games = np.asarray(train_games, dtype=np.int64)
         self.rng = np.random.default_rng(seed)
+        self.pack_rng = np.random.default_rng(seed + 12345)   # sample_packs: independent of the training stream
+        self.exclude_rids = None                 # game -> review ids the strong view must avoid (the fixed gallery pack's reviews)
+        self.allow_sp_doc = True                 # store-page sentences as a document strong view (off in gallery/bank modes)
+        self.build_weak = True                   # False: no weak pack (gallery mode uses the fixed packs)
         d = Path(data_dir)
         # memory-mapped by default: on an NVMe mirror the OS page cache serves the rows and several
         # processes share one copy; mmap=False reads the 8.5 GB into this process
@@ -191,27 +195,34 @@ class PoolSampler:
         wiki = self.F.wiki_doc(g) if use_doc_strong else None
         sp = self.F.doc(g)
         strong_doc = None
+        if sp is not None:
+            sp = sp[: self.cap]
         if use_doc_strong:
             if wiki is not None:
                 strong_doc, strong_doc_id = wiki, DOC_ID_WIKI
-            elif sp is not None:
+            elif sp is not None and self.allow_sp_doc:
                 strong_doc, strong_doc_id = sp, DOC_ID_SP
                 sp = None                       # the weak pack drops the prefix: no shared sentence
+        taken = np.zeros(len(lens), bool)
+        if self.exclude_rids is not None and g in self.exclude_rids:
+            taken |= np.isin(rids, list(self.exclude_rids[g]))     # the fixed pack's reviews never enter the strong view
         # weak pack: prefix + whole reviews under the cap
         row = 0 if sp is None else len(sp)
-        taken = np.zeros(len(lens), bool)
         w_segs = []
-        for j in order:
-            L = int(lens[j])
-            if row + L <= self.cap:
-                w_segs.append(j); taken[j] = True; row += L
-                if row == self.cap:
-                    break
+        if self.build_weak:
+            for j in order:
+                L = int(lens[j])
+                if taken[j]:
+                    continue
+                if row + L <= self.cap:
+                    w_segs.append(j); taken[j] = True; row += L
+                    if row == self.cap:
+                        break
         w_rows = np.concatenate([np.arange(starts[j], starts[j] + lens[j]) for j in w_segs]) if w_segs else np.zeros(0, np.int64)
         w_doc = np.concatenate([np.repeat(rids[j], lens[j]) for j in w_segs]) if w_segs else np.zeros(0, np.int64)
         xw = self.POOL[g][w_rows]                                       # (n, 1024) fp16 copy
         tw = np.zeros(len(w_rows), np.int8)
-        if sp is not None:
+        if sp is not None and self.build_weak:
             xw = np.concatenate([sp, xw]); w_doc = np.concatenate([np.full(len(sp), DOC_ID_SP), w_doc])
             tw = np.concatenate([np.ones(len(sp), np.int8), tw])
         # strong view
@@ -240,6 +251,34 @@ class PoolSampler:
             ds = np.concatenate([np.repeat(rids[j], lens[j]) for j in s_segs]) if s_segs else np.zeros(0, np.int64)
             ts = np.zeros(len(s_rows), np.int8)
         return xw, w_doc.astype(np.int64), tw, xs, ds, ts
+
+    def pack(self, g: int, rng) -> np.ndarray:
+        """one weak pack of game g by the k10 rule (store-page prefix, then whole reviews in rng's order while they fit),
+        always with the prefix: fp16 (n, 1024)"""
+        starts, lens, _ = self.segs[g]
+        sp = self.F.doc(g)
+        sp = None if sp is None else sp[: self.cap]
+        row = 0 if sp is None else len(sp)
+        segs = []
+        for j in rng.permutation(len(lens)):
+            L = int(lens[j])
+            if row + L <= self.cap:
+                segs.append(j); row += L
+                if row == self.cap:
+                    break
+        rows = np.concatenate([np.arange(starts[j], starts[j] + lens[j]) for j in segs]) if segs else np.zeros(0, np.int64)
+        x = self.POOL[g][rows]
+        return x if sp is None else np.concatenate([sp, x])
+
+    def sample_packs(self, gids) -> dict:
+        """weak packs only (prefix always included), from the sampler's own pack RNG: the bank's cold start and refills"""
+        gids = np.asarray(gids, dtype=np.int64)
+        packs = [self.pack(int(g), self.pack_rng) for g in gids]
+        Lw = max(len(p) for p in packs)
+        out = {"gids": gids, "xw": np.zeros((len(gids), Lw, 1024), np.float16), "lw": np.zeros(len(gids), np.int64)}
+        for b, p in enumerate(packs):
+            out["xw"][b, : len(p)] = p; out["lw"][b] = len(p)
+        return out
 
     # ---- one batch
     def sample(self, gids=None, B: int = 32) -> dict:
@@ -431,26 +470,29 @@ def fixed_packs(F: Fixtures, sampler: PoolSampler, games, cap: int = 512, seed_o
     """one FIXED 512-sentence pack per game from the review pool by the k10 pack rule (store-page prefix, then whole
     reviews in a seeded random order while they fit): the training gallery of --gallery full.  Seeds
     default_rng(SPLIT_SEED + seed_offset + g), so the packs differ from the pool-built selection pack (offset 5).
-    Returns X fp16 (G, cap, 1024), lens (G,)."""
+    Returns X fp16 (G, cap, 1024), lens (G,), and the review ids of every pack (the strong views avoid them)."""
     games = np.asarray(games, dtype=np.int64)
     X = np.zeros((len(games), cap, 1024), np.float16)
     L = np.zeros(len(games), np.int64)
+    used = []
     for j, g in enumerate(games):
-        starts, lens, _ = sampler.segs[int(g)]
+        starts, lens, rids = sampler.segs[int(g)]
         rng = np.random.default_rng(SPLIT_SEED + seed_offset + int(g))
         sp = F.doc(int(g))
+        sp = None if sp is None else sp[:cap]
         row = 0 if sp is None else len(sp)
         if sp is not None:
             X[j, :row] = sp
-        rows = []
+        rows, ids = [], []
         for i in rng.permutation(len(lens)):
             n = int(lens[i])
             if row + n <= cap:
-                rows.append(np.arange(starts[i], starts[i] + n)); row += n
+                rows.append(np.arange(starts[i], starts[i] + n)); ids.append(int(rids[i])); row += n
                 if row == cap:
                     break
         if rows:
             rr = np.concatenate(rows)
             X[j, row - len(rr):row] = sampler.POOL[int(g)][rr]
         L[j] = row
-    return X, L
+        used.append(np.asarray(ids, dtype=np.int64))
+    return X, L, used

@@ -190,7 +190,7 @@ def routed_ice_loss(zs, mask_s, M_s, a_w, cov_w, a_s=None, cov_s=None, *, tau: f
             cov_j = cov_w.detach().float().reshape(-1)
             if use_s:
                 cov_j = torch.cat([cov_j, (cov_s if cov_s is not None else torch.ones(B, K, device=dev)).detach().float().reshape(-1)])
-            logw = torch.log(cov_j.clamp(min=1e-6))                                 # (J,)
+            logw = torch.where(cov_j > 1e-8, cov_j.clamp(min=1e-8).log(), torch.full_like(cov_j, float("-inf")))   # (J,) zero coverage = out
         else:
             logw = torch.zeros(J, device=dev)
     cands = a_w.reshape(B * K, D) if not use_s else torch.cat([a_w.reshape(B * K, D), a_s.reshape(B * K, D)], 0)
@@ -222,7 +222,7 @@ def routed_anchor_loss(a_s, cov_s, h_s, a_w, cov_w, *, tau: float, margin: float
         cov_j = cov_w.float().reshape(-1)
         if use_strong_neg:
             cov_j = torch.cat([cov_j, cov_s.float().reshape(-1)])
-        logw = torch.log(cov_j.clamp(min=1e-6))                                        # (J,)
+        logw = torch.where(cov_j > 1e-8, cov_j.clamp(min=1e-8).log(), torch.full_like(cov_j, float("-inf")))   # (J,) zero coverage = out
         game_q = torch.arange(B, device=dev).repeat_interleave(K)                      # (BK,) game of each query anchor
         cand_game = (torch.arange(J, device=dev) // K) % B
         is_weak = torch.arange(J, device=dev) < B * K
@@ -277,7 +277,7 @@ def topic_monitors(ow: dict, os_: dict, mask_w, mask_s, ts, model, l_inv: float)
         review, doc = nonempty & (t0 == 0), nonempty & (t0 > 0)
     out["eff_topics_s_review"] = float(e_s[review].mean()) if review.any() else float("nan")
     out["eff_topics_s_doc"] = float(e_s[doc].mean()) if doc.any() else float("nan")
-    out["topics_per_elem_w"] = float((ow["M"] > 0.5).sum(-1)[~mask_w].float().mean())
+    out["topics_per_elem_w"] = float((ow["M"] > 0.5).sum(-1)[~mask_w].float().mean()) if ow.get("M") is not None and (~mask_w).any() else float("nan")
     out["topics_per_elem_s"] = float((os_["M"] > 0.5).sum(-1)[~mask_s].float().mean()) if (~mask_s).any() else 0.0
     has_mass = ow["mass"] > 1.0
     out["cov_mean_w"] = float(ow["cov"][has_mass].mean()) if has_mass.any() else 0.0   # coverage over the topics the pack has mass in

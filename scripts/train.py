@@ -80,6 +80,9 @@ def parse():
                     help="full: one FIXED 512-sentence pack per training game, all 1,694 games' topic anchors recomputed through the current W every step "
                          "(the original I-CE's gallery, plan 4.5); overrides --bank")
     ap.add_argument("--gallery-seed-offset", type=int, default=11, help="pack seeds default_rng(SPLIT_SEED + offset + g); 5 would reproduce the selection pack")
+    ap.add_argument("--doc-source", default=None, choices=["both", "wiki"],
+                    help="document strong views from the wiki article or the store page (both, the default without a bank) or from the wiki only "
+                         "(default with --bank/--gallery: a store-page view would be the pack's own prefix)")
     ap.add_argument("--bank-beta", type=float, default=0.1, help="EMA rate of the bank rows per visit of the game (a game is visited every ~26 steps at B = 64)")
     ap.add_argument("--bank-refill", type=int, default=0, help="B-learn: recompute the whole bank from fresh packs every this many steps (0 = never; "
                                                                 "B-frozen needs none, the bank stores data-side quantities and the assignment is fixed)")
@@ -117,12 +120,27 @@ def parse():
     ap.add_argument("--save-every", type=int, default=1000)
     ap.add_argument("--no-eval", action="store_true", help="skip the draw-0 evaluation (checkpoints are still saved; select later with scripts/select_ckpt.py)")
     args = ap.parse_args()
+    whole = args.design == "B" and (args.bank != "none" or args.gallery != "none")
     if args.K is None:
         args.K = 64 if args.design == "B" else 6
     if args.tau is None:
-        args.tau = 0.03 if args.design == "B" else 0.07
+        args.tau = (0.05 if whole else 0.03) if args.design == "B" else 0.07
     if args.margin is None:
         args.margin = 0.05 if args.design == "B" else 0.15
+    if args.doc_source is None:
+        args.doc_source = "wiki" if whole else "both"
+    if whole:
+        if args.bank != "none" and args.gallery != "none":
+            ap.error("--bank and --gallery are alternatives")
+        for flag in ("no_neg_cov", "weak_no_grad", "no_strong_neg"):
+            if getattr(args, flag):
+                ap.error(f"--{flag.replace('_', '-')} does not apply with --bank/--gallery (negatives are the whole gallery, always coverage-weighted)")
+        if args.balance == "batch":
+            ap.error("--balance batch does not apply with --bank/--gallery")
+        learns = args.learn_gain or args.freeze_protos != -1 or args.assign_map
+        if learns and args.loss_level == "sentence":
+            ap.error("with --bank/--gallery the assignment gets no gradient from the sentence-level loss (plan 4.5): "
+                     "freeze it (--freeze-protos -1, no --learn-gain/--assign-map) or use --loss-level anchor|both")
     return args
 
 
@@ -158,20 +176,22 @@ def step_A(model, batch, args, dev):
 
 
 def step_B_bank(model, bank, row_of_game, batch, args, dev, gallery=None):
-    """design B against all training games' anchors.  --bank ema: the sampled pack updates its game's EMA row (no
-    gradient).  --gallery full: the bank holds the FIXED packs' topic sums; nothing is updated per step unless the
-    assignment learns (then the whole gallery is recomputed).  In both cases the strong view's elements (and/or topic
-    anchors) are contrasted against the bank anchors of all 1,694 training games through the current W."""
+    """design B against all training games' anchors.  --bank ema: the sampled pack (prefix always included, since
+    store-page doc views are off) updates its game's EMA row (no gradient).  --gallery full: the bank holds the FIXED
+    packs' topic sums, no weak pack is sampled, and the gallery is recomputed only when the assignment learns.  In
+    both cases the strong view's elements (and/or its topic anchors) are contrasted against the bank anchors of all
+    1,694 training games through the current W."""
     xw, mw, xs, ms = to_dev(batch, dev)
-    xw_c, xs_c = model.map_space(xw, mw), model.map_space(xs, ms)
+    xs_c = model.map_space(xs, ms)
     rows = row_of_game[torch.as_tensor(batch["gids"], device=dev)]
+    S_w = M_w = xw_c = None
     with torch.no_grad():
-        S_w = model.affinity(xw_c, mw)
-        M_w = model.membership(S_w, mw)
-        ow = model.aggregate(xw_c, mw, M_w)                                         # the sampled pack: monitors only in gallery mode
         if gallery is None:
+            xw_c = model.map_space(xw, mw)
+            S_w = model.affinity(xw_c, mw)
+            M_w = model.membership(S_w, mw)
             bank.update(rows, M_w, xw_c)
-        elif gallery["assignment_learns"]:
+        elif model.assignment_learns():
             fill_bank_from_packs(bank, model, gallery["X"], gallery["L"], B=args.batch)
     S_s = model.affinity(xs_c, ms)
     M_s = model.membership(S_s, ms)
@@ -180,18 +200,23 @@ def step_B_bank(model, bank, row_of_game, batch, args, dev, gallery=None):
     st = {}
     l_ice = torch.zeros((), device=dev)
     if args.loss_level in ("sentence", "both"):
-        l_ice, st = routed_bank_loss(xs_c, ms, M_s, rows, A, cov_A, rows, tau=args.tau, margin=args.margin, sigma=args.sigma, own_neg=not args.no_own_neg)
-    if args.loss_level in ("anchor", "both"):                                        # the strong view's topic anchors as the elements
+        l_ice, st = routed_bank_loss(xs_c, ms, M_s, rows, A, cov_A, tau=args.tau, margin=args.margin, sigma=args.sigma, own_neg=not args.no_own_neg)
+    if args.loss_level in ("anchor", "both"):                                        # the strong view's topic anchors as the elements (gradient kept)
         K = model.K
         eye = torch.eye(K, device=dev)[None].expand(len(rows), -1, -1)
-        l_a, st_a = routed_bank_loss(os_["anchors"], os_["cov"] <= 0.5, eye, rows, A, cov_A, rows, tau=args.tau, margin=args.margin, sigma=0.0,
-                                     own_neg=not args.no_own_neg)
+        l_a, st_a = routed_bank_loss(os_["anchors"], torch.zeros(len(rows), K, dtype=torch.bool, device=dev), eye, rows, A, cov_A,
+                                     tau=args.tau, margin=args.margin, sigma=0.0, own_neg=not args.no_own_neg, elem_w=os_["hist"])
         l_ice = l_ice + l_a
         st.update({"a" + k: v for k, v in st_a.items()})
     l_inv = routed_inv_loss(os_["anchors"], A[rows].detach(), os_["hist"], cov_A[rows].detach())
-    ow["M"], os_["M"] = M_w, M_s
-    return l_ice, l_inv, st, {"S": [S_w, S_s], "mask": [mw, ms], "x": [xw_c, xs_c], "M": [M_w, M_s], "g": None,
-                              "ow": ow, "os": os_, "mw": mw, "ms": ms, "xs": xs, "S_s": S_s}
+    with torch.no_grad():                                                           # the pack side of the monitors = this game's bank row
+        n_rows = bank.n[rows]
+        ow = {"anchors": A[rows].detach(), "hist": n_rows / n_rows.sum(1, keepdim=True).clamp(min=1e-6), "cov": cov_A[rows].detach(),
+              "mass": n_rows, "M": M_w}
+    os_["M"] = M_s
+    x_list = [xs_c] if xw_c is None else [xw_c, xs_c]
+    return l_ice, l_inv, st, {"S": [S_s] if S_w is None else [S_w, S_s], "mask": [ms] if M_w is None else [mw, ms], "x": x_list,
+                              "M": [M_s] if M_w is None else [M_w, M_s], "g": None, "ow": ow, "os": os_, "mw": mw, "ms": ms, "xs": xs, "S_s": S_s}
 
 
 def step_B(model, batch, args, dev):
@@ -245,6 +270,7 @@ def main():
     log({"event": "fold", "fold": args.fold, "train": len(idx["train"]), "val": len(idx["val"]), "test": len(idx["test"])})
     sampler = PoolSampler(F, idx["train"], cap=args.cap, ns_min=args.ns_min, ns_max=args.ns_max, p_doc=args.p_doc,
                           seed=args.seed, data_dir=Path(args.data_dir), mmap=not args.pool_in_ram)
+    sampler.allow_sp_doc = args.doc_source == "both"
     plen = np.load(Path(args.data_dir) / "wscan_pool_rev_len.npy")
     log({"event": "pool_loaded", "sec": round(time.time() - t0, 1)})
 
@@ -272,6 +298,12 @@ def main():
         np.save(out / "protos_init.npy", model.protos.detach().cpu().numpy())
         log({"event": "codebook_init", **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in init.items()}, "sec": round(time.time() - t0, 1)})
     log({"event": "model", "design": args.design, "params": model.n_params(), "K": args.K})
+    gain_learns = False
+    if args.design == "B":                                                           # freeze the assignment BEFORE anything reads assignment_learns()
+        model.protos.requires_grad_(args.freeze_protos == 0)
+        # the gain follows the prototypes' schedule (B-frozen: both fixed; B-learn: both learn after the warm-up)
+        gain_learns = args.learn_gain or (args.freeze_protos != -1 and not args.freeze_gain)
+        model.gain.requires_grad_(args.learn_gain or (gain_learns and args.freeze_protos == 0))
     bank = row_of_game = gallery = None
     if args.design == "B" and (args.bank == "ema" or args.gallery == "full"):
         row_of_game = torch.full((F.NG,), -1, dtype=torch.long, device=dev)
@@ -279,16 +311,17 @@ def main():
         bank = AnchorBank(len(idx["train"]), args.K, 1024, beta=args.bank_beta, device=dev)
         tb = time.time()
         if args.gallery == "full":
-            Xg, Lg = fixed_packs(F, sampler, idx["train"], cap=args.cap, seed_offset=args.gallery_seed_offset)
-            gallery = {"X": torch.from_numpy(Xg).to(dev), "L": Lg,
-                       "assignment_learns": args.learn_gain or args.freeze_protos != -1 or args.assign_map}
-            del Xg
+            Xg, Lg, used = fixed_packs(F, sampler, idx["train"], cap=args.cap, seed_offset=args.gallery_seed_offset)
+            gallery = {"X": Xg, "L": Lg}                                             # stays in host memory; chunks stream to the GPU when recomputed
+            sampler.exclude_rids = {int(g): set(u.tolist()) for g, u in zip(idx["train"], used)}   # strong views avoid the pack's reviews
+            sampler.build_weak = False                                               # no re-sampled weak pack in gallery mode
             fill_bank_from_packs(bank, model, gallery["X"], gallery["L"], B=args.batch)
             log({"event": "gallery_built", "games": len(Lg), "mean_len": float(np.mean(Lg)), "full": int((Lg == args.cap).sum()),
-                 "assignment_learns": gallery["assignment_learns"], **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
+                 "excluded_reviews_mean": float(np.mean([len(u) for u in used])), "assignment_learns": model.assignment_learns(),
+                 **{k: round(v, 4) for k, v in bank.stats(model.lam).items()}, "sec": round(time.time() - tb, 1)})
         else:
             fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch, log=log)
-            log({"event": "bank_filled", **{k: round(v, 4) for k, v in bank.stats().items()}, "sec": round(time.time() - tb, 1)})
+            log({"event": "bank_filled", **{k: round(v, 4) for k, v in bank.stats(model.lam).items()}, "sec": round(time.time() - tb, 1)})
 
     # ---- optimiser
     if args.design == "A":
@@ -301,11 +334,6 @@ def main():
         others = [p for n, p in named.items() if n not in ("dW.weight", "dU.weight", "protos")]
         groups = [{"params": decay, "weight_decay": args.wd, "mult": 1.0}, {"params": others, "weight_decay": 0.0, "mult": 1.0},
                   {"params": [named["protos"]], "weight_decay": 0.0, "mult": args.proto_lr_mult}]
-        model.protos.requires_grad_(args.freeze_protos == 0)
-        # the gain follows the prototypes' schedule (B-frozen: both fixed; B-learn: both learn after the warm-up)
-        gain_learns = args.learn_gain or (args.freeze_protos != -1 and not args.freeze_gain)
-        gain_now = args.learn_gain or (gain_learns and args.freeze_protos == 0)
-        model.gain.requires_grad_(gain_now)
     opt = torch.optim.AdamW(groups, lr=args.lr, betas=(0.9, 0.98))
 
     # ---- evaluation assets: draw 0 at the training budget (memory-mapped) and the standardised queries
@@ -359,10 +387,10 @@ def main():
             if gain_learns:
                 model.gain.requires_grad_(True)
             log({"event": "protos_unfrozen", "step": step, "gain_learns": gain_learns})
-        if bank is not None and gallery is None and args.bank_refill > 0 and step % args.bank_refill == 0:   # stale topic boundaries after the prototypes moved
+        if (bank is not None and gallery is None and args.bank_refill > 0 and step % args.bank_refill == 0
+                and args.freeze_protos >= 0 and step > args.freeze_protos):          # stale topic boundaries after the prototypes moved
             tb = time.time()
-            bank.seen.zero_()
-            fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch)
+            fill_bank(bank, model, sampler, idx["train"], row_of_game, B=args.batch, reset=True)
             log({"event": "bank_refilled", "step": step, "sec": round(time.time() - tb, 1)})
         batch = pref.next()
         l_ice, l_inv, st, aux = step_fn(model, batch, args, dev)
@@ -379,7 +407,8 @@ def main():
                 model.gain.clamp_(model.gain_min, model.gain_max)                 # projection: a clamped parameter would lose its gradient at the bound
                 if model.protos.requires_grad:
                     model.protos.copy_(torch.nn.functional.normalize(model.protos, dim=-1))   # stay on the sphere: constant effective lr
-            run = model.update_running(aux["mask"], aux["x"], aux["M"], g_star=aux["g"])
+            if gallery is None:                                                    # gallery mode: the prior and the duals stay at their initial values
+                run = model.update_running(aux["mask"], aux["x"], aux["M"], g_star=aux["g"], update_duals=model.assignment_learns())
         for k, v in {"loss": float(loss), "ice": float(l_ice), "inv": float(l_inv), "gn": float(gn), **st}.items():
             ema[k] = v if k not in ema else 0.9 * ema[k] + 0.1 * v
         if step % args.log_every == 0:
@@ -396,8 +425,9 @@ def main():
                 mon = topic_monitors(aux["ow"], aux["os"], aux["mw"], aux["ms"], batch["ts"], model, float(l_inv))
                 mon.update(run)
                 mon["s_std"] = float(aux["S_s"][~aux["ms"]].std())
+                mon["g_bar_frozen"] = int(not model.assignment_learns())
                 if bank is not None:
-                    mon.update(bank.stats())
+                    mon.update(bank.stats(model.lam))
             log({"step": step, "monitor": {k: (round(v, 4) if isinstance(v, float) else v) for k, v in mon.items()}})
         do_eval = not args.no_eval and (step % args.eval_every == 0 or step == args.steps)
         if step % args.save_every == 0 or step == args.steps or do_eval:

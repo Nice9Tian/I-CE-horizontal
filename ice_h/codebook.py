@@ -194,7 +194,7 @@ class TopicCodebook(nn.Module):
         return None if self.rho is None else self.eps / self.rho
 
     @torch.no_grad()
-    def update_running(self, mask_list, x_list, M_list, g_star: torch.Tensor | None = None) -> dict:
+    def update_running(self, mask_list, x_list, M_list, g_star: torch.Tensor | None = None, update_duals: bool = True) -> dict:
         """The running estimates after one step, from the memberships the batch actually used.
 
         g_bar: stochastic-approximation step on the population balance condition E[mass_k] = N c / K,
@@ -210,7 +210,9 @@ class TopicCodebook(nn.Module):
         xp = torch.cat([x[~m] for x, m in zip(x_list, mask_list)], 0)                   # (N_tot, D)
         col = Mp.sum(0)
         target = Mp.shape[0] * self.c / self.K
-        if g_star is not None:
+        if not update_duals:                                                             # frozen assignment: g_bar stays, the sentence-to-topic function is fixed
+            pass
+        elif g_star is not None:
             self.g_bar.mul_(1.0 - self.beta).add_(self.beta * g_star)
         elif self.kappa is None:
             self.g_bar.sub_(self.dual_lr * (col - target) / target)
@@ -272,6 +274,10 @@ class TopicCodebook(nn.Module):
         return {"proto_drift": float((p * F.normalize(self.protos0, dim=-1)).sum(-1).mean()),
                 "proto_dup_max": float(off.max()), "gain": gain,
                 "gain_at_bound": int(gain <= self.gain_min + 1e-6 or gain >= self.gain_max - 1e-6)}
+
+    def assignment_learns(self) -> bool:
+        """does any parameter of the sentence-to-topic function currently receive gradient"""
+        return bool(self.protos.requires_grad or self.gain.requires_grad or (self.dU is not None and self.dU.weight.requires_grad))
 
     def n_params(self) -> int:
         return sum(p.numel() for p in self.parameters())
